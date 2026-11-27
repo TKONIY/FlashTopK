@@ -181,3 +181,11 @@ def test_select_fast_and_edge_cases():
         # Compare against canonical_topk over finite entries (matching Select's finite-only contract).
         ref_in = torch.where(torch.isfinite(scores), scores, torch.tensor(float("-inf"), device="cuda"))
         assert_same((out_s, out_i), canonical_topk(ref_in, k))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_refine16_exact(dtype):
+    """16-row Refine16Sm100 (triggered at seq_len_kv >= 256K) matches exact canonical top-k on non-multiple rows."""
+    q, kv, s, w, ks, ke = make_call(33, 262144, dtype, seed=23)
+    got = flashtopk.Selector(TOPK, dtype=dtype, pruning="always", return_scores=True).run(q, kv, w, ks, ke, s)
+    assert_same(got, canonical_topk(dense_scores(q, kv, s, w, ks, ke)))

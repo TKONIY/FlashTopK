@@ -36,8 +36,9 @@ from .common import (
 )
 from .prune_sm100 import Prune24Bf16Sm100, Prune24Sm100, PruneSm100
 from .prune_sm90 import PruneSm90
-from .refine_sm100 import RefineSm100
+from .refine_sm100 import Refine16Sm100, RefineSm100
 from .refine_sm100 import max_blocks as refine_max_blocks
+from .refine_sm100 import max_blocks_16 as refine_max_blocks_16
 from .refine_sm90 import MAX_BLOCKS as REFINE_SM90_MAX_BLOCKS
 from .refine_sm90 import RefineSm90
 from .scan_sm100 import ScanSm100
@@ -255,11 +256,12 @@ def _compile_prune_sm100(bf16: bool, cols: int = PRUNE_COLS):
 
 
 @functools.cache
-def _compile_refine_sm100(bf16: bool):
+def _compile_refine_sm100(bf16: bool, block_q: int = REFINE_BLOCK_Q):
     num_q, num_q_heads, seq_len_kv, num_scales, num_words, cand_cap = (cute.sym_int() for _ in range(6))
     elem = _elem(bf16)
+    cls = Refine16Sm100 if block_q == PRUNE_BLOCK_Q else RefineSm100
     return cute.compile(
-        RefineSm100(bf16=bf16),
+        cls(bf16=bf16),
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (num_q_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
         make_fake_tensor(Float32, (num_q, NUM_HEADS), divisibility=4),
@@ -303,17 +305,19 @@ def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin
 
 
 def _refine_sm100(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                  cand_cnt, flag=None, expected_flag: int = 0):
+                  cand_cnt, flag=None, expected_flag: int = 0, block_q: int = REFINE_BLOCK_Q):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
     bf16 = kv_scales is None
     mask_blocks = mask.shape[1]
-    min_splits = math.ceil(mask_blocks / refine_max_blocks(bf16))
+    bq = PRUNE_BLOCK_Q if (block_q == PRUNE_BLOCK_Q and seq_len_kv >= 256 * 1024) else REFINE_BLOCK_Q
+    max_blk = refine_max_blocks_16(bf16) if bq == PRUNE_BLOCK_Q else refine_max_blocks(bf16)
+    min_splits = math.ceil(mask_blocks / max_blk)
     flag_t = ks[:1] if flag is None else flag
-    _compile_refine_sm100(bf16)(
+    _compile_refine_sm100(bf16, bq)(
         as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights,
         _pruning_scales(kv, kv_scales, knsc), mask.view(-1), ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
         cand_cnt, flag_t, num_q, seq_len_kv, mask_blocks,
-        prune_kv_splits(num_q, seq_len_kv, REFINE_BLOCK_Q, min_splits, sm_count(q.device.index)), expected_flag,
+        prune_kv_splits(num_q, seq_len_kv, bq, min_splits, sm_count(q.device.index)), expected_flag,
     )
 
 
@@ -513,8 +517,9 @@ def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks,
     planner's operand, already in the pruning kernel's layout."""
     mask = prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
                       flag=flag, expected_flag=expected_flag)
+    block_q = PRUNE_BLOCK_Q if w_prune.shape[1] <= 20 else REFINE_BLOCK_Q
     prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                 cand_cnt, flag=flag, expected_flag=expected_flag)
+                 cand_cnt, flag=flag, expected_flag=expected_flag, block_q=block_q)
 
 
 def mask_shape(num_q: int, seq_len_kv: int) -> Tuple[int, int, int]:
@@ -535,12 +540,15 @@ def prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin,
 
 
 def prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                 cand_cnt, flag=None, expected_flag: int = 0) -> None:
+                 cand_cnt, flag=None, expected_flag: int = 0, block_q: int = REFINE_BLOCK_Q) -> None:
     """Pruning's second kernel: the full score of the keys the mask keeps, appended to the candidates as the scan
     would."""
-    run = _refine_sm90 if arch(q) == 9 else _refine_sm100
-    run(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-        flag=flag, expected_flag=expected_flag)
+    if arch(q) == 9:
+        _refine_sm90(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
+                     cand_cnt, flag=flag, expected_flag=expected_flag)
+    else:
+        _refine_sm100(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
+                      cand_cnt, flag=flag, expected_flag=expected_flag, block_q=block_q)
 
 
 @functools.cache
@@ -777,7 +785,8 @@ def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int) -> None:
         _compile_scan_sm100(False, bf16, True)
         _compile_prune_sm100(bf16, PRUNE_COLS)
         _compile_prune_sm100(bf16, PRUNE_COLS_24)
-        _compile_refine_sm100(bf16)
+        _compile_refine_sm100(bf16, REFINE_BLOCK_Q)
+        _compile_refine_sm100(bf16, PRUNE_BLOCK_Q)
     _compile_sample_gather(bf16)
     _compile_decide(False, True)
     if arch_major == 10:

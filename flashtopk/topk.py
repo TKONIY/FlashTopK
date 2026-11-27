@@ -370,10 +370,14 @@ class Selector:
                     launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
                                       origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
                     launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
-                                        flag=self._flag, expected_flag=-1)
+                                        flag=self._flag, expected_flag=1, block_q=16)
+                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                        flag=self._flag, expected_flag=2, block_q=8)
                 else:
-                    launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, prune_ks, ke, *gate,
-                                      flag=self._flag, expected_flag=1)
+                    mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                             origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                        flag=self._flag, expected_flag=1, block_q=16)
                 pruned = self._flag
             launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows)
             self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices)
