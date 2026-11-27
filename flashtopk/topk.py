@@ -29,7 +29,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from . import plan as planner
-from .kernels import launch
+from .kernels import graph_cond, launch
 from .kernels.common import HEAD_DIM, PRUNE_COLS_24
 from .kernels.selection import H_CAND_MAX, HEALTH_WORDS, RECOVERY_ROWS
 from .recovery import Recovery
@@ -366,23 +366,60 @@ class Selector:
                     self._flag, scan_ks, prune_ks, self._estimate, prune24_ks, use_eff_window=True,
                 )
                 estimate = self._estimate
-                launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *scan_gate)
-                q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
-                if three_way:
-                    mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
-                                             origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
-                    q24, w24, _, _, _ = plan.operands(PRUNE_COLS_24)
-                    launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
-                                      origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
-                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
-                                        flag=self._flag, expected_flag=1, block_q=16)
-                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
-                                        flag=self._flag, expected_flag=2, block_q=8)
+                if graph_cond.is_capturing(q.device.index):
+                    # Pre-allocate/resolve buffers on the main capture stream so conditional child graphs allocate nothing.
+                    mask = torch.empty(launch.mask_shape(num_q, seq_len_kv), dtype=torch.int32, device=q.device)
+                    kv_sc_p = None if kv_scales is None else launch.padded_scales(kv_scales)
+                    if kv_sc_p is None:
+                        launch.unit_scales(kv)
+                    if launch.arch(q) == 9:
+                        launch.q_operand_sm90(q)
+                    q_prune, w_prune, allowance, knsc, _ = plan.operands()
+                    q24, w24 = (plan.operands(PRUNE_COLS_24)[:2] if three_way else (None, None))
+
+                    def _br_scan() -> None:
+                        launch.scan(q, kv, kv_sc_p, weights, scan_ks, ke, *scan_gate)
+
+                    def _br_prune16() -> None:
+                        planner.key_norms(plan, kv, self._flag)
+                        plan.rows(num_q, False, self._flag, target_flag=1, skip_est=True, write_plan=True)
+                        launch.prune_mask(q_prune, kv, kv_sc_p, knsc, w_prune, allowance, prune_ks, ke,
+                                          origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=1)
+                        launch.prune_refine(q, kv, kv_sc_p, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
+
+                    branches = [_br_scan, _br_prune16]
+                    if three_way:
+                        def _br_prune24() -> None:
+                            planner.key_norms(plan, kv, self._flag)
+                            plan.rows(num_q, False, self._flag, cols=PRUNE_COLS_24, target_flag=2, skip_est=False,
+                                      write_plan=True)
+                            launch.prune_mask(q24, kv, kv_sc_p, knsc, w24, allowance, prune24_ks, ke,
+                                              origin, inv_delta, th_bucket, mask=mask, flag=self._flag,
+                                              expected_flag=2)
+                            launch.prune_refine(q, kv, kv_sc_p, knsc, weights, mask, ks, ke, *gate,
+                                                flag=self._flag, expected_flag=2, block_q=8)
+
+                        branches.append(_br_prune24)
+                    graph_cond.switch_i32(self._flag, branches)
                 else:
-                    mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
-                                             origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
-                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
-                                        flag=self._flag, expected_flag=1, block_q=16)
+                    launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *scan_gate)
+                    q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
+                    if three_way:
+                        mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                                 origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                        q24, w24, _, _, _ = plan.operands(PRUNE_COLS_24)
+                        launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
+                                          origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=2, block_q=8)
+                    else:
+                        mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                                 origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
                 pruned = self._flag
             th_select = th_bucket if mode == "always" else th_bucket_scan
             with launch.select_gate_scope(origin, inv_delta, th_select):
