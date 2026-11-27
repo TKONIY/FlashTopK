@@ -643,6 +643,19 @@ def decide(est16, est24, ks, ke, scan_ks, prune16_ks, prune24_ks, flag, seq_len_
     )
 
 
+_SCAN_TH_OUT: contextvars.ContextVar = contextvars.ContextVar("flashtopk_scan_th_out", default=None)
+
+
+@contextlib.contextmanager
+def scan_th_scope(th_bucket_scan: torch.Tensor):
+    """Route SeedPrep's 4-sigma scan threshold into `th_bucket_scan` while preserving `seed_prep`'s signature."""
+    token = _SCAN_TH_OUT.set(th_bucket_scan)
+    try:
+        yield
+    finally:
+        _SCAN_TH_OUT.reset(token)
+
+
 @functools.cache
 def _compile_seed_prep():
     num_q, width = cute.sym_int(), cute.sym_int()
@@ -658,6 +671,7 @@ def _compile_seed_prep():
         make_fake_tensor(Float32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
+        make_fake_tensor(Int32, vec),
         Int32(0),
         Int32(0),
         Float32(0.0),
@@ -671,9 +685,13 @@ def seed_prep(sample, ks, ke, col_lo, col_hi, topk: int, slack_topk: float, k_mi
               cand_cnt) -> None:
     """Each row's bucket map (origin, inv_delta) and seed gate (th_bucket) from its samples sample[r, col_lo[r]:
     col_hi[r]], aiming at the topk-th best key of a row read whole and at about slack_topk candidates otherwise (at
-    least the k_min-th best sample); cand_cnt is zeroed."""
-    _compile_seed_prep()(sample, ks, ke, col_lo, col_hi, origin, inv_delta, th_bucket, cand_cnt, sample.shape[0],
-                         topk, slack_topk, k_min)
+    least the k_min-th best sample); cand_cnt is zeroed. When called inside `scan_th_scope(buf)`, also emits the
+    4-sigma scan gate into `buf`."""
+    th_scan = _SCAN_TH_OUT.get()
+    if th_scan is None or th_scan.shape != th_bucket.shape:
+        th_scan = th_bucket
+    _compile_seed_prep()(sample, ks, ke, col_lo, col_hi, origin, inv_delta, th_bucket, th_scan, cand_cnt,
+                         sample.shape[0], topk, slack_topk, k_min)
 
 
 @functools.cache

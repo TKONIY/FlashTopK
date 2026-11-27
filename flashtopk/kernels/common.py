@@ -141,6 +141,11 @@ def div_rn(a, b, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
+def sqrt_rn(a, *, loc=None, ip=None) -> Float32:
+    return _f32_asm("sqrt.rn.f32", a, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def fma_rn(a, b, c, *, loc=None, ip=None) -> Float32:
     return _f32_asm("fma.rn.f32", a, b, c, loc=loc, ip=ip)
 

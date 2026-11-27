@@ -208,6 +208,7 @@ class Selector:
         self._origin = torch.empty(max_rows, dtype=torch.float32, device=dev)
         self._inv_delta = torch.empty(max_rows, dtype=torch.float32, device=dev)
         self._th_bucket = torch.empty(max_rows, **i32)
+        self._th_bucket_scan = torch.empty(max_rows, **i32)
         self._cand_cnt = torch.empty(max_rows, **i32)
         self._lo = torch.empty(max_rows, **i32)
         self._hi = torch.empty(max_rows, **i32)
@@ -331,6 +332,7 @@ class Selector:
         cand_idx = arena[num_q * cap: 2 * num_q * cap].view(torch.int32).view(num_q, cap)
         origin, inv_delta = self._origin[:num_q], self._inv_delta[:num_q]
         th_bucket = self._th_bucket[:num_q]
+        th_bucket_scan = self._th_bucket_scan[:num_q]
         lo, hi = self._lo[:num_q], self._hi[:num_q]
         seed_topk = min(topk + SEED_MARGIN, cap)
         slack = GATE_SLACK * topk
@@ -341,11 +343,13 @@ class Selector:
         with torch.cuda.device(q.device), scope:
             launch.sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples, sample, cand_cnt, lo, hi, health,
                                  self._sample_kv, self._sample_scales)
-            launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
-                             th_bucket, cand_cnt)
+            with launch.scan_th_scope(th_bucket_scan):
+                launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
+                                 th_bucket, cand_cnt)
             gate = (origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt)
+            scan_gate = (origin, inv_delta, th_bucket_scan, cand_val, cand_idx, cand_cnt)
             if mode == "off":
-                launch.scan(q, kv, kv_scales, weights, ks, ke, *gate)
+                launch.scan(q, kv, kv_scales, weights, ks, ke, *scan_gate)
             elif mode == "always":
                 q_prune, w_prune, allowance, knsc, _ = planner.plan_operands(q, weights, kv, kv_scales, ks, ke, origin,
                                                                              inv_delta, th_bucket)
@@ -361,7 +365,7 @@ class Selector:
                     self._flag, scan_ks, prune_ks, self._estimate, prune24_ks, use_eff_window=True,
                 )
                 estimate = self._estimate
-                launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *gate)
+                launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *scan_gate)
                 q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
                 if three_way:
                     mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
