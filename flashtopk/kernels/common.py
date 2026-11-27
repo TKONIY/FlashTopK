@@ -14,15 +14,15 @@ NUM_HEADS = 32
 HEAD_DIM = 128
 NEXT_N = 8  # query rows of a scan tile
 BLOCK_KV = 128  # keys of a KV block: KV splits and the pruning mask are counted in these
-PRUNE_BLOCK_Q = 16  # query rows of a 16-column pruning tile
+PRUNE_BLOCK_Q = 16  # query rows of a pruning tile (16-col and 24-col SM100)
 PRUNE_COLS = 16  # default columns of the pruning operand
-PRUNE_COLS_24 = 24  # tighter 24-column pruning operand (SM100: 22 retained + 2 agg, 8-row tile)
+PRUNE_COLS_24 = 24  # tighter 24-column pruning operand (SM100: 22 retained + 2 agg, 16-row tile)
 REFINE_BLOCK_Q = 8  # query rows of a refine tile
 
 
 def prune_block_q(cols: int = PRUNE_COLS) -> int:
-    """Query rows per SM100 pruning tile (16 for 16 columns, 8 for 24 columns)."""
-    return 8 if cols == PRUNE_COLS_24 else PRUNE_BLOCK_Q
+    """Query rows per SM100 pruning tile (16 for both 16-col and 24-col row-split kernels)."""
+    return PRUNE_BLOCK_Q
 
 
 @dsl_user_op

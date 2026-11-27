@@ -34,7 +34,7 @@ from .common import (
     REFINE_BLOCK_Q,
     prune_block_q,
 )
-from .prune_sm100 import PruneSm100
+from .prune_sm100 import Prune24Bf16Sm100, Prune24Sm100, PruneSm100
 from .prune_sm90 import PruneSm90
 from .refine_sm100 import RefineSm100
 from .refine_sm100 import max_blocks as refine_max_blocks
@@ -223,11 +223,17 @@ def _scan_sm100(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket,
 def _compile_prune_sm100(bf16: bool, cols: int = PRUNE_COLS):
     num_q, pair_heads, seq_len_kv, num_scales, num_words = (cute.sym_int() for _ in range(5))
     elem = _elem(bf16)
+    w_cols = 20 if cols == PRUNE_COLS else (24 if bf16 else 28)
+    kernel_cls = (
+        PruneSm100(bf16=bf16)
+        if cols == PRUNE_COLS
+        else (Prune24Bf16Sm100(bf16=True) if bf16 else Prune24Sm100(bf16=False))
+    )
     return cute.compile(
-        PruneSm100(bf16=bf16, cols=cols),
+        kernel_cls,
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (pair_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
-        make_fake_tensor(Float32, (num_q, cols), divisibility=4),
+        make_fake_tensor(Float32, (num_q, w_cols), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Int32, (num_q,)),
@@ -286,8 +292,8 @@ def _pruning_scales(kv, kv_scales, knsc):
 def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket, mask,
                 flag=None, expected_flag: int = 0):
     num_q, seq_len_kv = ks.shape[0], kv.shape[0]
-    cols = w_prune.shape[1]
-    block_q = prune_block_q(cols)
+    cols = PRUNE_COLS if w_prune.shape[1] <= 20 else PRUNE_COLS_24
+    block_q = 8 if (cols == PRUNE_COLS_24 and kv_scales is None) else prune_block_q(cols)
     flag_t = ks[:1] if flag is None else flag
     _compile_prune_sm100(kv_scales is None, cols)(
         as_operand(kv), as_operand(q_prune).view(-1, HEAD_DIM, 1), w_prune, _pruning_scales(kv, kv_scales, knsc),

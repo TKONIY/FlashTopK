@@ -73,12 +73,22 @@ assert EST_WORDS == 2 * (_PLAN_SAMPLES // 32)
 # constant gate planned FP8 aggregate rows and allowances differently (survival estimates up to 5x off, and twice the
 # refine work).
 @triton.jit
-def _operand_row(row, col, LAYOUT: tl.constexpr, NCOL: tl.constexpr):
-    """Where row `row`, column `col` of the pruning operand goes: SM100 (LAYOUT 1) takes row pairs column by column,
-    [pair, column, row of pair]; SM90 (LAYOUT 2) 16-row tiles permuted by prune_sm90.n_of (row 4b + a, column
-    2d + e of a tile is operand row 64a + 8d + 2b + e)."""
+def _operand_row(row, col, LAYOUT: tl.constexpr, NCOL: tl.constexpr, HAS_LIN: tl.constexpr):
+    """Where row `row`, column `col` of the pruning operand goes:
+    - SM100 (LAYOUT 1): 8-row blocks of (8 * NCOL + 16) when HAS_LIN (16-col N=144, FP8 24-col N=208)
+      with cols 0..NCOL-1 in pair order and cols NCOL..NCOL+1 (lin_hi, lin_lo) appended;
+      or 8-row blocks of (8 * NCOL) when not HAS_LIN (BF16 24-col N=192).
+    - SM90 (LAYOUT 2): 16-row tiles permuted by prune_sm90.n_of."""
     if LAYOUT == 1:
-        return (row // 2) * (2 * NCOL) + col * 2 + row % 2
+        wg = row // 8
+        lr = row % 8
+        p = lr // 2
+        pr = lr % 2
+        main_off = p * (2 * NCOL) + col * 2 + pr
+        if HAS_LIN:
+            lin_off = 8 * NCOL + p * 4 + (col - NCOL) * 2 + pr
+            return wg * (8 * NCOL + 16) + tl.where(col < NCOL, main_off, lin_off)
+        return wg * (8 * NCOL) + main_off
     else:
         r = row % 16
         return (row // 16) * 256 + 64 * (r % 4) + 8 * (col // 2) + 2 * (r // 4) + col % 2
@@ -140,8 +150,10 @@ def _plan_kernel(
     if row >= num_q:
         if (write_plan != 0) & (row < padded):
             c = tl.arange(0, H)
-            tl.store(QS + _operand_row(row, c, LAYOUT, R + 2)[:, None] * 128 + d[None, :],
-                     tl.zeros([H, 128], dtype=QS.dtype.element_ty), mask=(c < R + 2)[:, None])
+            has_lin: tl.constexpr = (LAYOUT == 1) and not (BF16 and (R + 2 == 24))
+            wcols = (R + 4) if has_lin else (R + 2)
+            tl.store(QS + _operand_row(row, c, LAYOUT, R + 2, has_lin)[:, None] * 128 + d[None, :],
+                     tl.zeros([H, 128], dtype=QS.dtype.element_ty), mask=(c < wcols)[:, None])
         return
     h = tl.arange(0, H)
     q8 = tl.load(Q + row * H * 128 + h[:, None] * 128 + d[None, :])
@@ -227,8 +239,30 @@ def _plan_kernel(
     quant = tl.sqrt(tl.sum((a - hi - lo) * (a - hi - lo), axis=0))
     an = tl.sqrt(tl.sum(hi * hi, axis=0)) + tl.sqrt(tl.sum(lo * lo, axis=0))
 
-    mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + e
-    allow = (e + quant) * (1.0 + 2.0**-20) + rounding * mass
+    has_lin: tl.constexpr = (LAYOUT == 1) and not (BF16 and (R + 2 == 24))
+    if has_lin:
+        q_lin = tl.sum((0.5 * wt)[:, None] * q, axis=0)
+        if BF16:
+            lin_scale_hi = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0) + 1.0
+            lin_scale_lo = lin_scale_hi
+            lin8_hi = q_lin.to(tl.bfloat16)
+            l_hi = lin8_hi.to(tl.float32)
+            lin8_lo = (q_lin - l_hi).to(tl.bfloat16)
+            l_lo = lin8_lo.to(tl.float32)
+        else:
+            lin_scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(q_lin), axis=0), 1e-30) / 448.0)))
+            lin8_hi = (q_lin / lin_scale_hi).to(tl.float8e4nv)
+            l_hi = lin8_hi.to(tl.float32) * lin_scale_hi
+            lin_scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(q_lin - l_hi), axis=0), 1e-30) / 448.0)))
+            lin8_lo = ((q_lin - l_hi) / lin_scale_lo).to(tl.float8e4nv)
+            l_lo = lin8_lo.to(tl.float32) * lin_scale_lo
+        quant_lin = tl.sqrt(tl.sum((q_lin - l_hi - l_lo) * (q_lin - l_hi - l_lo), axis=0))
+        lin_norm = tl.sqrt(tl.sum(l_hi * l_hi, axis=0)) + tl.sqrt(tl.sum(l_lo * l_lo, axis=0))
+        mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + lin_norm + e
+        allow = (e + quant + quant_lin) * (1.0 + 2.0**-20) + rounding * mass
+    else:
+        mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + e
+        allow = (e + quant) * (1.0 + 2.0**-20) + rounding * mass
     allow = tl.where(allow < float("inf"), allow, float("inf"))
 
     # Which samples pruning would keep for this row: the bound on the samples against the seed gate (the kernel's
@@ -256,12 +290,18 @@ def _plan_kernel(
 
     if write_plan != 0:
         slot = tl.where(kept, rank, R)
-        tl.store(QS + _operand_row(row, slot, LAYOUT, R + 2)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
-        tl.store(QS + _operand_row(row, R, LAYOUT, R + 2) * 128 + d, a8_hi)
-        tl.store(QS + _operand_row(row, R + 1, LAYOUT, R + 2) * 128 + d, a8_lo)
-        tl.store(WS + row * (R + 2) + slot, wt, mask=kept)
-        tl.store(WS + row * (R + 2) + R, scale_hi)
-        tl.store(WS + row * (R + 2) + R + 1, scale_lo)
+        w_stride = (R + 6) if has_lin else (R + 2)
+        tl.store(QS + _operand_row(row, slot, LAYOUT, R + 2, has_lin)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
+        tl.store(QS + _operand_row(row, R, LAYOUT, R + 2, has_lin) * 128 + d, a8_hi)
+        tl.store(QS + _operand_row(row, R + 1, LAYOUT, R + 2, has_lin) * 128 + d, a8_lo)
+        tl.store(WS + row * w_stride + slot, wt, mask=kept)
+        tl.store(WS + row * w_stride + R, scale_hi)
+        tl.store(WS + row * w_stride + R + 1, scale_lo)
+        if has_lin:
+            tl.store(QS + _operand_row(row, R + 2, LAYOUT, R + 2, has_lin) * 128 + d, lin8_hi)
+            tl.store(QS + _operand_row(row, R + 3, LAYOUT, R + 2, has_lin) * 128 + d, lin8_lo)
+            tl.store(WS + row * w_stride + R + 2, lin_scale_hi)
+            tl.store(WS + row * w_stride + R + 3, lin_scale_lo)
         tl.store(ALLOW + row, allow)
 
 
@@ -313,10 +353,13 @@ class _Plan:
         self.ncols = cols
         self.alloc_cols = PRUNE_COLS_24 if three_way else cols
         self.layout = 2 if torch.cuda.get_device_capability(dev)[0] == 9 else 1
-        group = 16 if self.layout == 2 else 2
+        group = 16
+        self.bf16 = kv_scales is None
         self.padded = triton.cdiv(num_q, group) * group
-        self.q_prune = torch.empty(self.padded * self.alloc_cols, dim, dtype=q.dtype, device=dev)
-        self.w_prune = torch.empty(num_q * self.alloc_cols, dtype=torch.float32, device=dev)
+        alloc_q_per_row = self._q_rows_per_q(self.alloc_cols)
+        alloc_w_cols = self._w_cols(self.alloc_cols)
+        self.q_prune = torch.empty(self.padded * alloc_q_per_row, dim, dtype=q.dtype, device=dev)
+        self.w_prune = torch.empty(num_q * alloc_w_cols, dtype=torch.float32, device=dev)
         self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
         self.est_rows = estimate_rows(num_q)
         self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
@@ -329,7 +372,6 @@ class _Plan:
         self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
         self.cols, picked = _plan_sample_cols(nk, dev.index)
         self.k_samples = kv[picked].contiguous()
-        self.bf16 = kv_scales is None
         if self.bf16:
             self.s_samples = torch.ones(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
         else:
@@ -344,6 +386,16 @@ class _Plan:
         self.kv_scales = kv_scales
         self.args = (q, weights, ks, ke, origin, inv_delta, th_bucket)
 
+    def _has_lin(self, cols: int) -> bool:
+        return self.layout == 1 and not (self.bf16 and cols == PRUNE_COLS_24)
+
+    def _q_rows_per_q(self, cols: int) -> int:
+        return (cols + 2) if self._has_lin(cols) else cols
+
+    def _w_cols(self, cols: int) -> int:
+        # SM100 linear-term layouts append lin_scale_hi/lo and pad to multiple of 4 (20 for 16-col, 28 for FP8 24-col).
+        return (cols + 4) if self._has_lin(cols) else cols
+
     def rows(self, num_q: int, estimate: bool, flag: Optional[torch.Tensor], *,
              cols: Optional[int] = None, target_flag: int = 1, skip_est: bool = True, write_plan: bool = True) -> None:
         """Plan the estimate groups' rows (estimate), else every row; with ``flag``, run only when
@@ -351,8 +403,9 @@ class _Plan:
         q, weights, ks, ke, origin, inv_delta, th_bucket = self.args
         c = self.ncols if cols is None else cols
         est_buf = self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est
-        q_view = self.q_prune[: self.padded * c]
-        w_view = self.w_prune[: num_q * c].view(num_q, c)
+        q_view = self.q_prune[: self.padded * self._q_rows_per_q(c)]
+        wc = self._w_cols(c)
+        w_view = self.w_prune[: num_q * wc].view(num_q, wc)
         _plan_kernel[(self.est_rows if estimate else self.padded,)](
             q, weights, self.k_samples, self.s_samples, self.knsc_samples, self.cols, ks, ke, origin, inv_delta,
             th_bucket, q_view, w_view, self.allowance, est_buf, ks if flag is None else flag,
@@ -369,9 +422,10 @@ class _Plan:
     def operands(self, cols: Optional[int] = None):
         c = self.ncols if cols is None else cols
         num_q = self.args[0].shape[0]
+        wc = self._w_cols(c)
         return (
-            self.q_prune[: self.padded * c],
-            self.w_prune[: num_q * c].view(num_q, c),
+            self.q_prune[: self.padded * self._q_rows_per_q(c)],
+            self.w_prune[: num_q * wc].view(num_q, wc),
             self.allowance,
             self.knsc,
             self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est,
