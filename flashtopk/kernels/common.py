@@ -14,15 +14,15 @@ NUM_HEADS = 32
 HEAD_DIM = 128
 NEXT_N = 8  # query rows of a scan tile
 BLOCK_KV = 128  # keys of a KV block: KV splits and the pruning mask are counted in these
-PRUNE_BLOCK_Q = 16  # query rows of a 16-column pruning tile
+PRUNE_BLOCK_Q = 16  # query rows of a pruning tile (16-col and 24-col SM100)
 PRUNE_COLS = 16  # default columns of the pruning operand
-PRUNE_COLS_24 = 24  # tighter 24-column pruning operand (SM100: 22 retained + 2 agg, 8-row tile)
+PRUNE_COLS_24 = 24  # tighter 24-column pruning operand (SM100: 22 retained + 2 agg, 16-row tile)
 REFINE_BLOCK_Q = 8  # query rows of a refine tile
 
 
 def prune_block_q(cols: int = PRUNE_COLS) -> int:
-    """Query rows per SM100 pruning tile (16 for 16 columns, 8 for 24 columns)."""
-    return 8 if cols == PRUNE_COLS_24 else PRUNE_BLOCK_Q
+    """Query rows per SM100 pruning tile (16 for both 16-col and 24-col row-split kernels)."""
+    return PRUNE_BLOCK_Q
 
 
 @dsl_user_op
@@ -93,6 +93,37 @@ def select_i32(predicate, true_value, false_value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def select_u32(predicate, true_value, false_value, *, loc=None, ip=None):
+    return cutlass.Uint32(
+        arith.select(
+            cutlass.Boolean(predicate).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(true_value).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(false_value).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ctz_u32(x, *, loc=None, ip=None) -> Int32:
+    """Count trailing zeros of nonzero uint32 x (2 PTX ops: brev + clz)."""
+    return Int32(
+        llvm.inline_asm(
+            Int32.mlir_type,
+            [cutlass.Uint32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 r; brev.b32 r, $1; clz.b32 $0, r; }",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fp32_to_i32_bits(value, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.bitcast(Int32.mlir_type, Float32(value).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
@@ -138,6 +169,11 @@ def add_rn(a, b, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def div_rn(a, b, *, loc=None, ip=None) -> Float32:
     return _f32_asm("div.rn.f32", a, b, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def sqrt_rn(a, *, loc=None, ip=None) -> Float32:
+    return _f32_asm("sqrt.rn.f32", a, loc=loc, ip=ip)
 
 
 @dsl_user_op

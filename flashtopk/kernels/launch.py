@@ -34,10 +34,11 @@ from .common import (
     REFINE_BLOCK_Q,
     prune_block_q,
 )
-from .prune_sm100 import PruneSm100
+from .prune_sm100 import Prune24Bf16Sm100, Prune24Sm100, PruneSm100
 from .prune_sm90 import PruneSm90
-from .refine_sm100 import RefineSm100
+from .refine_sm100 import Refine16Sm100, RefineSm100
 from .refine_sm100 import max_blocks as refine_max_blocks
+from .refine_sm100 import max_blocks_16 as refine_max_blocks_16
 from .refine_sm90 import MAX_BLOCKS as REFINE_SM90_MAX_BLOCKS
 from .refine_sm90 import RefineSm90
 from .scan_sm100 import ScanSm100
@@ -83,9 +84,9 @@ def scan_kv_splits(num_q: int, seq_len_kv: int, sm_count: int) -> int:
 def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int, int, int]:
     """Return ``(num_splits, full_tiles, tail_chunks)`` for ScanSm100.
 
-    When query tiles exceed one wave (up to 8 full waves) and leave a partial tail wave, keep full waves
-    single-split (register cursor, zero atomics) and split only the tail tiles across KV in ``tail_chunks`` pieces
-    so the last wave fills the GPU. Otherwise fall back to uniform ``scan_kv_splits``.
+    When query tiles exceed one wave and leave a partial tail wave, keep full waves single-split
+    (register cursor, zero atomics) and split only the tail tiles across KV in ``tail_chunks``
+    pieces so the last wave fills the GPU. Otherwise fall back to uniform ``scan_kv_splits``.
     """
     num_tiles = math.ceil(num_q / NEXT_N)
     if num_tiles < sm_count:
@@ -93,10 +94,10 @@ def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int,
     full_waves = num_tiles // sm_count
     tail = num_tiles % sm_count
     total_kv_blocks = math.ceil(seq_len_kv / BLOCK_KV)
-    if tail == 0 or full_waves > 8 or total_kv_blocks < 16:
+    if tail == 0 or total_kv_blocks < 16:
         return 1, num_tiles, 1
-    # Fixed setup/tail overhead of splitting a tile in units of 128-key blocks.
-    unit_overhead = 8.0 / total_kv_blocks
+    # Persistent CTAs hide Q/W setup behind double-buffering, leaving tiny per-piece overhead.
+    unit_overhead = 2.0 / total_kv_blocks
 
     def cost(c: int) -> float:
         if c == 1:
@@ -105,7 +106,7 @@ def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int,
         return full_waves + tail_waves / c + tail_waves * unit_overhead
 
     candidates = [1]
-    for c in (2, 4, 8):
+    for c in (2, 3, 4, 5, 6, 8):
         if total_kv_blocks // c >= 8:
             candidates.append(c)
     best_c = min(candidates, key=cost)
@@ -202,15 +203,20 @@ def _compile_scan_sm100(single_split: bool, bf16: bool, dense: bool):
 
 
 def _scan_sm100(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-                dense: bool, q_operand=None):
+                dense: bool, q_operand=None, min_splits: int = 1):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
-    num_splits, full_tiles, tail_chunks = pick_scan_schedule(num_q, seq_len_kv, sm_count(q.device.index))
+    sms = sm_count(q.device.index)
+    if dense and min_splits > 1:
+        num_tiles = math.ceil(num_q / NEXT_N)
+        num_splits, full_tiles, tail_chunks = max(scan_kv_splits(num_q, seq_len_kv, sms), min_splits), num_tiles, 1
+    else:
+        num_splits, full_tiles, tail_chunks = pick_scan_schedule(num_q, seq_len_kv, sms)
     bf16 = kv_scales is None
     scales = unit_scales(kv) if bf16 else padded_scales(kv_scales)
     single_split = num_splits == 1 and tail_chunks == 1 and not dense
     _compile_scan_sm100(single_split, bf16, dense)(
-        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights, scales, ks, ke, origin, inv_delta,
-        th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, num_splits, full_tiles, tail_chunks,
+        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights, scales, ks, ke, origin,
+        inv_delta, th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, num_splits, full_tiles, tail_chunks,
     )
 
 
@@ -218,11 +224,17 @@ def _scan_sm100(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket,
 def _compile_prune_sm100(bf16: bool, cols: int = PRUNE_COLS):
     num_q, pair_heads, seq_len_kv, num_scales, num_words = (cute.sym_int() for _ in range(5))
     elem = _elem(bf16)
+    w_cols = 20 if cols == PRUNE_COLS else (24 if bf16 else 28)
+    kernel_cls = (
+        PruneSm100(bf16=bf16)
+        if cols == PRUNE_COLS
+        else (Prune24Bf16Sm100(bf16=True) if bf16 else Prune24Sm100(bf16=False))
+    )
     return cute.compile(
-        PruneSm100(bf16=bf16, cols=cols),
+        kernel_cls,
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (pair_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
-        make_fake_tensor(Float32, (num_q, cols), divisibility=4),
+        make_fake_tensor(Float32, (num_q, w_cols), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Float32, (num_scales,), divisibility=4),
         make_fake_tensor(Int32, (num_q,)),
@@ -244,11 +256,12 @@ def _compile_prune_sm100(bf16: bool, cols: int = PRUNE_COLS):
 
 
 @functools.cache
-def _compile_refine_sm100(bf16: bool):
+def _compile_refine_sm100(bf16: bool, block_q: int = REFINE_BLOCK_Q):
     num_q, num_q_heads, seq_len_kv, num_scales, num_words, cand_cap = (cute.sym_int() for _ in range(6))
     elem = _elem(bf16)
+    cls = Refine16Sm100 if block_q == PRUNE_BLOCK_Q else RefineSm100
     return cute.compile(
-        RefineSm100(bf16=bf16),
+        cls(bf16=bf16),
         make_fake_tensor(elem, (seq_len_kv, HEAD_DIM), divisibility=16),
         make_fake_tensor(elem, (num_q_heads, HEAD_DIM, 1), divisibility=16, leading_dim=1),
         make_fake_tensor(Float32, (num_q, NUM_HEADS), divisibility=4),
@@ -281,8 +294,8 @@ def _pruning_scales(kv, kv_scales, knsc):
 def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket, mask,
                 flag=None, expected_flag: int = 0):
     num_q, seq_len_kv = ks.shape[0], kv.shape[0]
-    cols = w_prune.shape[1]
-    block_q = prune_block_q(cols)
+    cols = PRUNE_COLS if w_prune.shape[1] <= 20 else PRUNE_COLS_24
+    block_q = 8 if (cols == PRUNE_COLS_24 and kv_scales is None) else prune_block_q(cols)
     flag_t = ks[:1] if flag is None else flag
     _compile_prune_sm100(kv_scales is None, cols)(
         as_operand(kv), as_operand(q_prune).view(-1, HEAD_DIM, 1), w_prune, _pruning_scales(kv, kv_scales, knsc),
@@ -292,17 +305,19 @@ def _mask_sm100(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin
 
 
 def _refine_sm100(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                  cand_cnt, flag=None, expected_flag: int = 0):
+                  cand_cnt, flag=None, expected_flag: int = 0, block_q: int = REFINE_BLOCK_Q):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
     bf16 = kv_scales is None
     mask_blocks = mask.shape[1]
-    min_splits = math.ceil(mask_blocks / refine_max_blocks(bf16))
+    bq = PRUNE_BLOCK_Q if (block_q == PRUNE_BLOCK_Q and seq_len_kv >= 256 * 1024) else REFINE_BLOCK_Q
+    max_blk = refine_max_blocks_16(bf16) if bq == PRUNE_BLOCK_Q else refine_max_blocks(bf16)
+    min_splits = math.ceil(mask_blocks / max_blk)
     flag_t = ks[:1] if flag is None else flag
-    _compile_refine_sm100(bf16)(
+    _compile_refine_sm100(bf16, bq)(
         as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights,
         _pruning_scales(kv, kv_scales, knsc), mask.view(-1), ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
         cand_cnt, flag_t, num_q, seq_len_kv, mask_blocks,
-        prune_kv_splits(num_q, seq_len_kv, REFINE_BLOCK_Q, min_splits, sm_count(q.device.index)), expected_flag,
+        prune_kv_splits(num_q, seq_len_kv, bq, min_splits, sm_count(q.device.index)), expected_flag,
     )
 
 
@@ -338,9 +353,9 @@ def _compile_scan_sm90(bf16: bool, single_split: bool, dense: bool):
 
 
 def _scan_sm90(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-               dense: bool, q_operand=None):
+               dense: bool, q_operand=None, min_splits: int = 1):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
-    num_splits = scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index))
+    num_splits = max(scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index)), min_splits if dense else 1)
     bf16 = kv_scales is None
     scales = unit_scales(kv) if bf16 else padded_scales(kv_scales)
     _compile_scan_sm90(bf16, num_splits == 1 and not dense, dense)(
@@ -484,7 +499,7 @@ def scan(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_v
 
 
 def scan_dense(q, kv, kv_scales, weights, ks, ke, out: torch.Tensor, scratch: torch.Tensor,
-               q_operand: Optional[torch.Tensor] = None) -> None:
+               q_operand: Optional[torch.Tensor] = None, min_splits: int = 1) -> None:
     """out[r, key] = row r's score of every key of its window [ks[r], ke[r]), in the scan's bits; other entries are
     left as they were. scratch: any [num_q] 4-byte tensor (the gate's inputs, read and unused). On SM90 q_operand,
     when given, is q's operand already laid out (q_operand_sm90)."""
@@ -492,7 +507,7 @@ def scan_dense(q, kv, kv_scales, weights, ks, ke, out: torch.Tensor, scratch: to
     bucket = scratch.view(torch.int32)
     run = _scan_sm90 if arch(q) == 9 else _scan_sm100
     run(q, kv, kv_scales, weights, ks, ke, gate, gate, bucket, out, out.view(torch.int32), bucket, dense=True,
-        q_operand=q_operand)
+        q_operand=q_operand, min_splits=min_splits)
 
 
 def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
@@ -502,8 +517,9 @@ def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks,
     planner's operand, already in the pruning kernel's layout."""
     mask = prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
                       flag=flag, expected_flag=expected_flag)
+    block_q = PRUNE_BLOCK_Q if w_prune.shape[1] <= 20 else REFINE_BLOCK_Q
     prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                 cand_cnt, flag=flag, expected_flag=expected_flag)
+                 cand_cnt, flag=flag, expected_flag=expected_flag, block_q=block_q)
 
 
 def mask_shape(num_q: int, seq_len_kv: int) -> Tuple[int, int, int]:
@@ -524,12 +540,15 @@ def prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, ks, ke, origin,
 
 
 def prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
-                 cand_cnt, flag=None, expected_flag: int = 0) -> None:
+                 cand_cnt, flag=None, expected_flag: int = 0, block_q: int = REFINE_BLOCK_Q) -> None:
     """Pruning's second kernel: the full score of the keys the mask keeps, appended to the candidates as the scan
     would."""
-    run = _refine_sm90 if arch(q) == 9 else _refine_sm100
-    run(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-        flag=flag, expected_flag=expected_flag)
+    if arch(q) == 9:
+        _refine_sm90(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
+                     cand_cnt, flag=flag, expected_flag=expected_flag)
+    else:
+        _refine_sm100(q, kv, kv_scales, knsc, weights, mask, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx,
+                      cand_cnt, flag=flag, expected_flag=expected_flag, block_q=block_q)
 
 
 @functools.cache
@@ -624,6 +643,19 @@ def decide(est16, est24, ks, ke, scan_ks, prune16_ks, prune24_ks, flag, seq_len_
     )
 
 
+_SCAN_TH_OUT: contextvars.ContextVar = contextvars.ContextVar("flashtopk_scan_th_out", default=None)
+
+
+@contextlib.contextmanager
+def scan_th_scope(th_bucket_scan: torch.Tensor):
+    """Route SeedPrep's 4-sigma scan threshold into `th_bucket_scan` while preserving `seed_prep`'s signature."""
+    token = _SCAN_TH_OUT.set(th_bucket_scan)
+    try:
+        yield
+    finally:
+        _SCAN_TH_OUT.reset(token)
+
+
 @functools.cache
 def _compile_seed_prep():
     num_q, width = cute.sym_int(), cute.sym_int()
@@ -639,6 +671,7 @@ def _compile_seed_prep():
         make_fake_tensor(Float32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
+        make_fake_tensor(Int32, vec),
         Int32(0),
         Int32(0),
         Float32(0.0),
@@ -652,23 +685,43 @@ def seed_prep(sample, ks, ke, col_lo, col_hi, topk: int, slack_topk: float, k_mi
               cand_cnt) -> None:
     """Each row's bucket map (origin, inv_delta) and seed gate (th_bucket) from its samples sample[r, col_lo[r]:
     col_hi[r]], aiming at the topk-th best key of a row read whole and at about slack_topk candidates otherwise (at
-    least the k_min-th best sample); cand_cnt is zeroed."""
-    _compile_seed_prep()(sample, ks, ke, col_lo, col_hi, origin, inv_delta, th_bucket, cand_cnt, sample.shape[0],
-                         topk, slack_topk, k_min)
+    least the k_min-th best sample); cand_cnt is zeroed. When called inside `scan_th_scope(buf)`, also emits the
+    4-sigma scan gate into `buf`."""
+    th_scan = _SCAN_TH_OUT.get()
+    if th_scan is None or th_scan.shape != th_bucket.shape:
+        th_scan = th_bucket
+    _compile_seed_prep()(sample, ks, ke, col_lo, col_hi, origin, inv_delta, th_bucket, th_scan, cand_cnt,
+                         sample.shape[0], topk, slack_topk, k_min)
+
+
+_SELECT_GATE: contextvars.ContextVar = contextvars.ContextVar("flashtopk_select_gate", default=None)
+
+
+@contextlib.contextmanager
+def select_gate_scope(origin: torch.Tensor, inv_delta: torch.Tensor, th_bucket: torch.Tensor):
+    """Provide calibrated (origin, inv_delta, th_bucket) to `select` for the 1-pass FP32-log fast path."""
+    token = _SELECT_GATE.set((origin, inv_delta, th_bucket))
+    try:
+        yield
+    finally:
+        _SELECT_GATE.reset(token)
 
 
 @functools.cache
-def _compile_select(topk: int, source: int):
+def _compile_select(topk: int, source: int, write_scores: bool = True, has_gate: bool = False):
     rows, cap, slots, out_rows = (cute.sym_int() for _ in range(4))
     vec = (rows,)
     return cute.compile(
-        Select(topk, source),
+        Select(topk, source, write_scores=write_scores, has_gate=has_gate),
         make_fake_tensor(Float32, (rows, cap)),
         make_fake_tensor(Int32, (rows, cap)),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, (slots,)),
+        make_fake_tensor(Float32, vec),
+        make_fake_tensor(Float32, vec),
+        make_fake_tensor(Int32, vec),
         make_fake_tensor(Float32, (out_rows, topk)),
         make_fake_tensor(Int32, (out_rows, topk)),
         make_fake_tensor(cutlass.Int64, (HEALTH_WORDS,)),
@@ -688,30 +741,47 @@ def _unused_health(device_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
             torch.zeros(RECOVERY_ROWS, dtype=torch.int32, device=device))
 
 
-def select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows, stats: bool = False) -> None:
+def select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows, stats: bool = False,
+           write_scores: bool = True) -> None:
     """Each row's exact top-k of its candidates into scores / indices in canonical order (score descending, index
     ascending; -inf / -1 padding last), accumulating the call's health and recording its first bad rows."""
-    _compile_select(scores.shape[1], CANDIDATES)(cand_val, cand_idx, cand_cnt, ks, ke, cand_cnt, scores, indices,
-                                                 health, bad_rows, cand_val.shape[0], 1, int(stats))
+    gate = _SELECT_GATE.get()
+    if gate is not None and gate[0].shape[0] == cand_val.shape[0]:
+        origin, inv_delta, th_bucket = gate
+        has_gate = True
+    else:
+        origin = inv_delta = cand_cnt.view(torch.float32)
+        th_bucket = cand_cnt
+        has_gate = False
+    _compile_select(scores.shape[1], CANDIDATES, write_scores, has_gate)(
+        cand_val, cand_idx, cand_cnt, ks, ke, cand_cnt, origin, inv_delta, th_bucket, scores, indices, health,
+        bad_rows, cand_val.shape[0], 1, int(stats),
+    )
 
 
-def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1) -> None:
+def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1, write_scores: bool = True) -> None:
     """Recovery: slot s's exact top-k over its window [ks[s], ke[s]) of dense[s] (the index is the column), in
     canonical order, to row row_map[s] of scores / indices; slots mapped to -1 are skipped. With splits > 1 each slot
     is cut into that many slices, and slice p of slot s writes its own top-k to row s * splits + p of the stage
     buffers scores / indices instead (select_staged finishes)."""
     health, bad_rows = _unused_health(dense.device.index)
-    _compile_select(scores.shape[1], DENSE)(dense, dense.view(torch.int32), ks, ks, ke, row_map, scores, indices,
-                                            health, bad_rows, dense.shape[0] * splits, splits, 0)
+    dummy_f = ks.view(torch.float32)
+    _compile_select(scores.shape[1], DENSE, write_scores, False)(
+        dense, dense.view(torch.int32), ks, ks, ke, row_map, dummy_f, dummy_f, ks, scores, indices, health, bad_rows,
+        dense.shape[0] * splits, splits, 0,
+    )
 
 
-def select_staged(stage_scores, stage_indices, row_map, scores, indices) -> None:
+def select_staged(stage_scores, stage_indices, row_map, scores, indices, write_scores: bool = True) -> None:
     """Recovery's second stage: slot s's exact top-k over its slices' selections (stage rows s * splits ... s * splits
     + splits - 1), to row row_map[s] of scores / indices."""
     health, bad_rows = _unused_health(stage_scores.device.index)
     slots = row_map.shape[0]
-    _compile_select(scores.shape[1], STAGED)(stage_scores.view(slots, -1), stage_indices.view(slots, -1), row_map,
-                                             row_map, row_map, row_map, scores, indices, health, bad_rows, slots, 1, 0)
+    dummy_f = row_map.view(torch.float32)
+    _compile_select(scores.shape[1], STAGED, write_scores, False)(
+        stage_scores.view(slots, -1), stage_indices.view(slots, -1), row_map, row_map, row_map, row_map,
+        dummy_f, dummy_f, row_map, scores, indices, health, bad_rows, slots, 1, 0,
+    )
 
 
 @functools.cache
@@ -766,14 +836,18 @@ def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int) -> None:
         _compile_scan_sm100(False, bf16, True)
         _compile_prune_sm100(bf16, PRUNE_COLS)
         _compile_prune_sm100(bf16, PRUNE_COLS_24)
-        _compile_refine_sm100(bf16)
+        _compile_refine_sm100(bf16, REFINE_BLOCK_Q)
+        _compile_refine_sm100(bf16, PRUNE_BLOCK_Q)
     _compile_sample_gather(bf16)
     _compile_decide(False, True)
     if arch_major == 10:
         _compile_decide(True, True)
     _compile_seed_prep()
     for source in (CANDIDATES, DENSE, STAGED):
-        _compile_select(topk, source)
+        for write_scores in (False, True):
+            _compile_select(topk, source, write_scores, False)
+            if source == CANDIDATES:
+                _compile_select(topk, source, write_scores, True)
     _compile_triage(words_per_head, arch_major == 9)
 
 

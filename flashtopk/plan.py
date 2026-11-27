@@ -73,12 +73,22 @@ assert EST_WORDS == 2 * (_PLAN_SAMPLES // 32)
 # constant gate planned FP8 aggregate rows and allowances differently (survival estimates up to 5x off, and twice the
 # refine work).
 @triton.jit
-def _operand_row(row, col, LAYOUT: tl.constexpr, NCOL: tl.constexpr):
-    """Where row `row`, column `col` of the pruning operand goes: SM100 (LAYOUT 1) takes row pairs column by column,
-    [pair, column, row of pair]; SM90 (LAYOUT 2) 16-row tiles permuted by prune_sm90.n_of (row 4b + a, column
-    2d + e of a tile is operand row 64a + 8d + 2b + e)."""
+def _operand_row(row, col, LAYOUT: tl.constexpr, NCOL: tl.constexpr, HAS_LIN: tl.constexpr):
+    """Where row `row`, column `col` of the pruning operand goes:
+    - SM100 (LAYOUT 1): 8-row blocks of (8 * NCOL + 16) when HAS_LIN (16-col N=144, FP8 24-col N=208)
+      with cols 0..NCOL-1 in pair order and cols NCOL..NCOL+1 (lin_hi, lin_lo) appended;
+      or 8-row blocks of (8 * NCOL) when not HAS_LIN (BF16 24-col N=192).
+    - SM90 (LAYOUT 2): 16-row tiles permuted by prune_sm90.n_of."""
     if LAYOUT == 1:
-        return (row // 2) * (2 * NCOL) + col * 2 + row % 2
+        wg = row // 8
+        lr = row % 8
+        p = lr // 2
+        pr = lr % 2
+        main_off = p * (2 * NCOL) + col * 2 + pr
+        if HAS_LIN:
+            lin_off = 8 * NCOL + p * 4 + (col - NCOL) * 2 + pr
+            return wg * (8 * NCOL + 16) + tl.where(col < NCOL, main_off, lin_off)
+        return wg * (8 * NCOL) + main_off
     else:
         r = row % 16
         return (row // 16) * 256 + 64 * (r % 4) + 8 * (col // 2) + 2 * (r // 4) + col % 2
@@ -110,6 +120,7 @@ def _plan_kernel(
     FLAG,  # [1] int32, gated only: must equal target_flag for this plan to run
     num_q,
     padded,  # rows of the operand, num_q rounded up to its row group; the rows past num_q are zeroed
+    total_pids,  # logical row count (est_rows for estimate, padded otherwise)
     rounding,
     estimate,  # nonzero: the estimate's rows only (program p is row p % G of estimate group p // G); else every row
     gated,  # nonzero: run only when FLAG == target_flag
@@ -123,146 +134,187 @@ def _plan_kernel(
     G: tl.constexpr,
     BF16: tl.constexpr,  # bf16 operands: the aggregate as two bf16 rows (scale 1)
     LAYOUT: tl.constexpr,  # the operand's layout (_operand_row)
+    HOIST_K: tl.constexpr,  # hoist shared k_samples/cols outside persistent row loop (big win on BF16)
 ):
-    pid = tl.program_id(0).to(tl.int64)
-    row = pid
-    if estimate != 0:
-        row = (pid // G) * (G * stride) + pid % G
-    est_row = _estimate_row(row, G, stride)
-    d = tl.arange(0, 128)
     if gated != 0:
-        if (tl.load(FLAG) != target_flag) | ((skip_est != 0) & est_row):
+        if tl.load(FLAG) != target_flag:
             return
-    if (estimate != 0) & (row >= num_q):
-        # A group's rows past the call: no samples, so they leave the group's union alone.
-        pad_slot = (row // (G * stride)) * G + row % G
-        tl.store(EST + pad_slot * (S // 16) + tl.arange(0, S // 16), tl.zeros([S // 16], dtype=tl.int32))
-    if row >= num_q:
-        if (write_plan != 0) & (row < padded):
-            c = tl.arange(0, H)
-            tl.store(QS + _operand_row(row, c, LAYOUT, R + 2)[:, None] * 128 + d[None, :],
-                     tl.zeros([H, 128], dtype=QS.dtype.element_ty), mask=(c < R + 2)[:, None])
-        return
-    h = tl.arange(0, H)
-    q8 = tl.load(Q + row * H * 128 + h[:, None] * 128 + d[None, :])
-    q = q8.to(tl.float32)
-    w = tl.load(W + row * H + h)
-    qn = tl.sqrt(tl.sum(q * q, axis=1))
-
-    # Activation rate of each head on the in-window samples.
+    d = tl.arange(0, 128)
     s = tl.arange(0, S)
-    k8 = tl.load(KS + s[:, None] * 128 + d[None, :])
-    cols = tl.load(COLS + s)
-    ks = tl.load(STARTS + row)
-    ke = tl.load(ENDS + row)
-    inwin = (cols >= ks) & (cols < ke)
-    act = tl.dot(q8, tl.trans(k8)) > 0
-    n_in = tl.sum(inwin.to(tl.float32), axis=0)
-    p = tl.sum((act & inwin[None, :]).to(tl.float32), axis=1) / tl.maximum(n_in, 1.0)
-    p = tl.where(n_in > 0, p, 0.5)
+    n_progs = tl.num_programs(0).to(tl.int64)
+    pid_start = tl.program_id(0).to(tl.int64)
+    if HOIST_K:
+        k8_h = tl.load(KS + s[:, None] * 128 + d[None, :])
+        cols_h = tl.load(COLS + s)
+    for pid in range(pid_start, total_pids.to(tl.int64), n_progs):
+        row = pid
+        if estimate != 0:
+            row = (pid // G) * (G * stride) + pid % G
+        est_row = _estimate_row(row, G, stride)
+        skip = (gated != 0) & (skip_est != 0) & est_row
+        if not skip:
+            if (estimate != 0) & (row >= num_q):
+                # A group's rows past the call: no samples, so they leave the group's union alone.
+                pad_slot = (row // (G * stride)) * G + row % G
+                tl.store(EST + pad_slot * (S // 16) + tl.arange(0, S // 16), tl.zeros([S // 16], dtype=tl.int32))
+            if row >= num_q:
+                if (write_plan != 0) & (row < padded):
+                    c = tl.arange(0, H)
+                    has_lin: tl.constexpr = (LAYOUT == 1) and not (BF16 and (R + 2 == 24))
+                    wcols = (R + 4) if has_lin else (R + 2)
+                    tl.store(QS + _operand_row(row, c, LAYOUT, R + 2, has_lin)[:, None] * 128 + d[None, :],
+                             tl.zeros([H, 128], dtype=QS.dtype.element_ty), mask=(c < wcols)[:, None])
+            else:
+                h = tl.arange(0, H)
+                q8 = tl.load(Q + row * H * 128 + h[:, None] * 128 + d[None, :])
+                q = q8.to(tl.float32)
+                w = tl.load(W + row * H + h)
+                qn = tl.sqrt(tl.sum(q * q, axis=1))
 
-    # Retained heads: every positive head first (by w |q|), then negative ones by |w| |q| min(p, 1 - p);
-    # a head's slot is its rank.
-    pos = w > 0
-    neg = w < 0
-    strength = tl.where(pos, w * qn, -w * qn * tl.minimum(p, 1.0 - p))
-    tier = tl.where(pos, 2.0, 0.0) + strength / (tl.max(strength, axis=0) + 1e-30)
-    tier = tl.where(pos | neg, tier, -1.0)
-    hh = h[None, :]
-    ahead = (tier[None, :] > tier[:, None]) | ((tier[None, :] == tier[:, None]) & (hh < h[:, None]))
-    rank = tl.sum(ahead.to(tl.int32), axis=1)
-    kept = rank < R
-    omit_pos = pos & ~kept
-    omit_neg = neg & ~kept
+                # Activation rate of each head on the in-window samples.
+                if HOIST_K:
+                    k8 = k8_h
+                    cols = cols_h
+                else:
+                    k8 = tl.load(KS + s[:, None] * 128 + d[None, :])
+                    cols = tl.load(COLS + s)
+                ks = tl.load(STARTS + row)
+                ke = tl.load(ENDS + row)
+                inwin = (cols >= ks) & (cols < ke)
+                act = tl.dot(q8, tl.trans(k8)) > 0
+                n_in = tl.sum(inwin.to(tl.float32), axis=0)
+                p = tl.sum((act & inwin[None, :]).to(tl.float32), axis=1) / tl.maximum(n_in, 1.0)
+                p = tl.where(n_in > 0, p, 0.5)
 
-    # Each omitted positive head projected onto its best retained anchor; rows that retain every positive head skip
-    # this. The bound holds for any alpha >= 0 whose residual v it charges, so the Gram matrix that picks anchors
-    # and alphas comes from BF16 tensor-core products (q's rows are exact in BF16), and the anchors' rows are
-    # loaded rather than multiplied out. The residuals' Gram matrix, which e_joint must not underestimate, comes
-    # from a two-way BF16 split v = v0 + v1 + r (|r| <= 2^-16 |v|) as v0 v0' + v0 v1' + v1 v0': the products are
-    # exact, the terms left out are at most 3 * 2^-16 |v_i| |v_j| and a truncating FP32 accumulator adds at most
-    # 2^-16 of the same, so the sum over pairs is within 2^-14 e_sep^2 -- a quarter of the 2^-12 e_sep^2 added under
-    # the root. (FP32 dot products here ran 4x slower than the rest of the plan on SM90.)
-    wt = tl.where(kept, w, 0.0)
-    e = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0)
-    if tl.sum(omit_pos.to(tl.int32), axis=0) > 0:
-        qb = q8.to(tl.bfloat16)
-        gram = tl.dot(qb, tl.trans(qb))  # [H, H]
-        gain = tl.where(kept[None, :], tl.maximum(gram, 0.0) * tl.maximum(gram, 0.0) / tl.maximum(qn * qn, 1e-30)[None, :],
-                        -1.0)
-        anchor = tl.argmax(gain, axis=1)
-        onehot = (hh == anchor[:, None]).to(tl.float32)  # [h, anchor]
-        g_anchor = tl.sum(gram * onehot, axis=1)
-        n_anchor = tl.sum((qn * qn)[None, :] * onehot, axis=1)
-        alpha = tl.where(omit_pos, tl.maximum(g_anchor, 0.0) / tl.maximum(n_anchor, 1e-30), 0.0)
-        wt += tl.sum(onehot * (w * alpha)[:, None], axis=0)
-        q_anchor = tl.load(Q + row * H * 128 + anchor[:, None] * 128 + d[None, :]).to(tl.float32)
-        v = tl.where(omit_pos[:, None], w[:, None] * (q - alpha[:, None] * q_anchor), 0.0)
-        vn = tl.sqrt(tl.sum(v * v, axis=1))
-        e_sep = tl.sum(vn, axis=0)
-        v0 = v.to(tl.bfloat16)
-        v1 = (v - v0.to(tl.float32)).to(tl.bfloat16)
-        gv = tl.dot(v0, tl.trans(v0)) + (tl.dot(v0, tl.trans(v1)) + tl.dot(v1, tl.trans(v0)))
-        e_joint = tl.sqrt(tl.sum(tl.sum(tl.maximum(gv, 0.0), axis=1), axis=0) + 2.0**-12 * e_sep * e_sep)
-        e = tl.minimum(e_sep, e_joint)
+                # Retained heads: every positive head first (by w |q|), then negative ones by |w| |q| min(p, 1 - p);
+                # a head's slot is its rank.
+                pos = w > 0
+                neg = w < 0
+                strength = tl.where(pos, w * qn, -w * qn * tl.minimum(p, 1.0 - p))
+                tier = tl.where(pos, 2.0, 0.0) + strength / (tl.max(strength, axis=0) + 1e-30)
+                tier = tl.where(pos | neg, tier, -1.0)
+                hh = h[None, :]
+                ahead = (tier[None, :] > tier[:, None]) | ((tier[None, :] == tier[:, None]) & (hh < h[:, None]))
+                rank = tl.sum(ahead.to(tl.int32), axis=1)
+                kept = rank < R
+                omit_pos = pos & ~kept
+                omit_neg = neg & ~kept
 
-    # The negative aggregate as two rows of the operand type: the high part and its rounding error, over
-    # power-of-two scales for FP8 (scale 1 for BF16, whose range is FP32's).
-    agg = tl.where(omit_neg & (p >= 0.5), -w, 0.0)
-    a = tl.sum(agg[:, None] * q, axis=0)
-    if BF16:
-        scale_hi = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0) + 1.0
-        scale_lo = scale_hi
-        a8_hi = a.to(tl.bfloat16)
-        hi = a8_hi.to(tl.float32)
-        a8_lo = (a - hi).to(tl.bfloat16)
-        lo = a8_lo.to(tl.float32)
-    else:
-        scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a), axis=0), 1e-30) / 448.0)))
-        a8_hi = (a / scale_hi).to(tl.float8e4nv)
-        hi = a8_hi.to(tl.float32) * scale_hi
-        scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a - hi), axis=0), 1e-30) / 448.0)))
-        a8_lo = ((a - hi) / scale_lo).to(tl.float8e4nv)
-        lo = a8_lo.to(tl.float32) * scale_lo
-    quant = tl.sqrt(tl.sum((a - hi - lo) * (a - hi - lo), axis=0))
-    an = tl.sqrt(tl.sum(hi * hi, axis=0)) + tl.sqrt(tl.sum(lo * lo, axis=0))
+                wt = tl.where(kept, w, 0.0)
+                e = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0)
+                if tl.sum(omit_pos.to(tl.int32), axis=0) > 0:
+                    qb = q8.to(tl.bfloat16)
+                    gram = tl.dot(qb, tl.trans(qb))  # [H, H]
+                    gain = tl.where(
+                        kept[None, :],
+                        tl.maximum(gram, 0.0) * tl.maximum(gram, 0.0) / tl.maximum(qn * qn, 1e-30)[None, :],
+                        -1.0,
+                    )
+                    anchor = tl.argmax(gain, axis=1)
+                    onehot = (hh == anchor[:, None]).to(tl.float32)  # [h, anchor]
+                    g_anchor = tl.sum(gram * onehot, axis=1)
+                    n_anchor = tl.sum((qn * qn)[None, :] * onehot, axis=1)
+                    alpha = tl.where(omit_pos, tl.maximum(g_anchor, 0.0) / tl.maximum(n_anchor, 1e-30), 0.0)
+                    wt += tl.sum(onehot * (w * alpha)[:, None], axis=0)
+                    # On BF16, qb is already bf16 so in-register Tensor Core gather avoids scattered global loads with no
+                    # extra SMEM tile; on FP8, keep the direct load so FP8 occupancy stays maximal when omit_pos == 0.
+                    if BF16:
+                        q_anchor = tl.dot(onehot.to(tl.bfloat16), qb)
+                    else:
+                        q_anchor = tl.load(Q + row * H * 128 + anchor[:, None] * 128 + d[None, :]).to(tl.float32)
+                    v = tl.where(omit_pos[:, None], w[:, None] * (q - alpha[:, None] * q_anchor), 0.0)
+                    vn = tl.sqrt(tl.sum(v * v, axis=1))
+                    e_sep = tl.sum(vn, axis=0)
+                    v0 = v.to(tl.bfloat16)
+                    v1 = (v - v0.to(tl.float32)).to(tl.bfloat16)
+                    gv01 = tl.dot(v0, tl.trans(v1))
+                    gv = tl.dot(v0, tl.trans(v0)) + (gv01 + tl.trans(gv01))
+                    e_joint = tl.sqrt(tl.sum(tl.sum(tl.maximum(gv, 0.0), axis=1), axis=0) + 2.0**-12 * e_sep * e_sep)
+                    e = tl.minimum(e_sep, e_joint)
 
-    mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + e
-    allow = (e + quant) * (1.0 + 2.0**-20) + rounding * mass
-    allow = tl.where(allow < float("inf"), allow, float("inf"))
+                # The negative aggregate as two rows of the operand type: the high part and its rounding error, over
+                # power-of-two scales for FP8 (scale 1 for BF16, whose range is FP32's).
+                agg = tl.where(omit_neg & (p >= 0.5), -w, 0.0)
+                a = tl.sum(agg[:, None] * q, axis=0)
+                if BF16:
+                    scale_hi = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0) + 1.0
+                    scale_lo = scale_hi
+                    a8_hi = a.to(tl.bfloat16)
+                    hi = a8_hi.to(tl.float32)
+                    a8_lo = (a - hi).to(tl.bfloat16)
+                    lo = a8_lo.to(tl.float32)
+                else:
+                    scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a), axis=0), 1e-30) / 448.0)))
+                    a8_hi = (a / scale_hi).to(tl.float8e4nv)
+                    hi = a8_hi.to(tl.float32) * scale_hi
+                    scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(a - hi), axis=0), 1e-30) / 448.0)))
+                    a8_lo = ((a - hi) / scale_lo).to(tl.float8e4nv)
+                    lo = a8_lo.to(tl.float32) * scale_lo
+                quant = tl.sqrt(tl.sum((a - hi - lo) * (a - hi - lo), axis=0))
+                an = tl.sqrt(tl.sum(hi * hi, axis=0)) + tl.sqrt(tl.sum(lo * lo, axis=0))
 
-    # Which samples pruning would keep for this row: the bound on the samples against the seed gate (the kernel's
-    # loose_raw_gate). An estimate only, for adaptive pruning, so the estimate groups' rows make it; the sample dot
-    # products are formed again here rather than kept live through the plan.
-    if est_row:
-        k8 = tl.load(KS + s[:, None] * 128 + d[None, :])
-        dots = tl.dot(q8, tl.trans(k8))  # [H, S]
-        reduced = tl.sum(wt[:, None] * tl.maximum(dots, 0.0), axis=0) - tl.maximum(
-            tl.sum(agg[:, None] * dots, axis=0), 0.0)
-        bound = tl.load(KSCALE + s) * reduced + allow * tl.load(KNSC + s)
-        inv = tl.load(INV + row)
-        c0 = -tl.load(ORIGIN + row) * inv
-        edge = tl.load(TH + row).to(tl.float32) + 1.0
-        slack = 2.0**-16 * tl.maximum(tl.maximum(tl.abs(c0), tl.abs(edge)), 1.0)
-        gate = tl.where((inv > 0) & (inv <= 3.4e38) & (tl.abs(c0) <= 3.4e38), (c0 - edge - slack) / inv,
-                        -float("inf"))
-        est_slot = (row // (G * stride)) * G + row % G
-        bit = (tl.arange(0, 32).to(tl.int64))[None, :]
-        win_words = tl.sum(tl.reshape(inwin.to(tl.int64), [S // 32, 32]) << bit, axis=1)
-        pass_words = tl.sum(tl.reshape((inwin & (bound > gate)).to(tl.int64), [S // 32, 32]) << bit, axis=1)
-        w8 = tl.arange(0, S // 32)
-        tl.store(EST + est_slot * (S // 16) + w8, win_words.to(tl.uint32).to(tl.int32, bitcast=True))
-        tl.store(EST + est_slot * (S // 16) + S // 32 + w8, pass_words.to(tl.uint32).to(tl.int32, bitcast=True))
+                has_lin: tl.constexpr = (LAYOUT == 1) and not (BF16 and (R + 2 == 24))
+                if has_lin:
+                    q_lin = tl.sum((0.5 * wt)[:, None] * q, axis=0)
+                    if BF16:
+                        lin_scale_hi = tl.sum(tl.zeros([H], dtype=tl.float32), axis=0) + 1.0
+                        lin_scale_lo = lin_scale_hi
+                        lin8_hi = q_lin.to(tl.bfloat16)
+                        l_hi = lin8_hi.to(tl.float32)
+                        lin8_lo = (q_lin - l_hi).to(tl.bfloat16)
+                        l_lo = lin8_lo.to(tl.float32)
+                    else:
+                        lin_scale_hi = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(q_lin), axis=0), 1e-30) / 448.0)))
+                        lin8_hi = (q_lin / lin_scale_hi).to(tl.float8e4nv)
+                        l_hi = lin8_hi.to(tl.float32) * lin_scale_hi
+                        lin_scale_lo = tl.exp2(tl.ceil(tl.log2(tl.maximum(tl.max(tl.abs(q_lin - l_hi), axis=0), 1e-30) / 448.0)))
+                        lin8_lo = ((q_lin - l_hi) / lin_scale_lo).to(tl.float8e4nv)
+                        l_lo = lin8_lo.to(tl.float32) * lin_scale_lo
+                    quant_lin = tl.sqrt(tl.sum((q_lin - l_hi - l_lo) * (q_lin - l_hi - l_lo), axis=0))
+                    lin_norm = tl.sqrt(tl.sum(l_hi * l_hi, axis=0)) + tl.sqrt(tl.sum(l_lo * l_lo, axis=0))
+                    mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + lin_norm + e
+                    allow = (e + quant + quant_lin) * (1.0 + 2.0**-20) + rounding * mass
+                else:
+                    mass = tl.sum(tl.abs(w) * qn, axis=0) + tl.sum(tl.abs(wt) * qn, axis=0) + an + e
+                    allow = (e + quant) * (1.0 + 2.0**-20) + rounding * mass
+                allow = tl.where(allow < float("inf"), allow, float("inf"))
 
-    if write_plan != 0:
-        slot = tl.where(kept, rank, R)
-        tl.store(QS + _operand_row(row, slot, LAYOUT, R + 2)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
-        tl.store(QS + _operand_row(row, R, LAYOUT, R + 2) * 128 + d, a8_hi)
-        tl.store(QS + _operand_row(row, R + 1, LAYOUT, R + 2) * 128 + d, a8_lo)
-        tl.store(WS + row * (R + 2) + slot, wt, mask=kept)
-        tl.store(WS + row * (R + 2) + R, scale_hi)
-        tl.store(WS + row * (R + 2) + R + 1, scale_lo)
-        tl.store(ALLOW + row, allow)
+                if est_row:
+                    if not HOIST_K:
+                        k8 = tl.load(KS + s[:, None] * 128 + d[None, :])
+                    dots = tl.dot(q8, tl.trans(k8))  # [H, S]
+                    reduced = tl.sum(wt[:, None] * tl.maximum(dots, 0.0), axis=0) - tl.maximum(
+                        tl.sum(agg[:, None] * dots, axis=0), 0.0)
+                    bound = tl.load(KSCALE + s) * reduced + allow * tl.load(KNSC + s)
+                    inv = tl.load(INV + row)
+                    c0 = -tl.load(ORIGIN + row) * inv
+                    edge = tl.load(TH + row).to(tl.float32) + 1.0
+                    slack = 2.0**-16 * tl.maximum(tl.maximum(tl.abs(c0), tl.abs(edge)), 1.0)
+                    gate = tl.where((inv > 0) & (inv <= 3.4e38) & (tl.abs(c0) <= 3.4e38), (c0 - edge - slack) / inv,
+                                    -float("inf"))
+                    est_slot = (row // (G * stride)) * G + row % G
+                    bit = (tl.arange(0, 32).to(tl.int64))[None, :]
+                    win_words = tl.sum(tl.reshape(inwin.to(tl.int64), [S // 32, 32]) << bit, axis=1)
+                    pass_words = tl.sum(tl.reshape((inwin & (bound > gate)).to(tl.int64), [S // 32, 32]) << bit, axis=1)
+                    w8 = tl.arange(0, S // 32)
+                    tl.store(EST + est_slot * (S // 16) + w8, win_words.to(tl.uint32).to(tl.int32, bitcast=True))
+                    tl.store(EST + est_slot * (S // 16) + S // 32 + w8, pass_words.to(tl.uint32).to(tl.int32, bitcast=True))
+
+                if write_plan != 0:
+                    slot = tl.where(kept, rank, R)
+                    w_stride = (R + 6) if has_lin else (R + 2)
+                    tl.store(QS + _operand_row(row, slot, LAYOUT, R + 2, has_lin)[:, None] * 128 + d[None, :], q8, mask=kept[:, None])
+                    tl.store(QS + _operand_row(row, R, LAYOUT, R + 2, has_lin) * 128 + d, a8_hi)
+                    tl.store(QS + _operand_row(row, R + 1, LAYOUT, R + 2, has_lin) * 128 + d, a8_lo)
+                    tl.store(WS + row * w_stride + slot, wt, mask=kept)
+                    tl.store(WS + row * w_stride + R, scale_hi)
+                    tl.store(WS + row * w_stride + R + 1, scale_lo)
+                    if has_lin:
+                        tl.store(QS + _operand_row(row, R + 2, LAYOUT, R + 2, has_lin) * 128 + d, lin8_hi)
+                        tl.store(QS + _operand_row(row, R + 3, LAYOUT, R + 2, has_lin) * 128 + d, lin8_lo)
+                        tl.store(WS + row * w_stride + R + 2, lin_scale_hi)
+                        tl.store(WS + row * w_stride + R + 3, lin_scale_lo)
+                    tl.store(ALLOW + row, allow)
 
 
 @triton.jit
@@ -284,9 +336,37 @@ def _key_norm_kernel(KV, SCALES, OUT, n, n_out, FLAG, BLOCK: tl.constexpr, GATED
         tl.store(OUT + i, tl.where(valid, norm * (1.0 + 2.0**-20), 0.0), mask=i < n_out)
 
 
+@torch.no_grad()
+def compute_kv_norms(kv: torch.Tensor, kv_scales: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Precompute ``scale * ||k|| * (1 + 2^-20)`` (4-float padded float32) for reuse across calls sharing ``kv``."""
+    kv = kv.contiguous()
+    nk = kv.shape[0]
+    n_out = (nk + 3) // 4 * 4
+    out = torch.empty(n_out, dtype=torch.float32, device=kv.device)
+    has_scales = kv_scales is not None
+    scales = kv_scales.reshape(-1).contiguous() if has_scales else out
+    grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
+    _key_norm_kernel[(grid,)](kv, scales, out, nk, n_out, out, BLOCK=64, GATED=False, HAS_SCALES=has_scales)
+    return out
+
+
+def _prepare_external_kv_norms(kv_norms: torch.Tensor, seq_len_kv: int) -> torch.Tensor:
+    knsc = kv_norms.reshape(-1).contiguous()
+    if knsc.dtype != torch.float32 or knsc.numel() < seq_len_kv:
+        raise ValueError(f"kv_norms must be float32 of at least {seq_len_kv} elements, got {knsc.dtype} {tuple(kv_norms.shape)}")
+    n_out = (seq_len_kv + 3) // 4 * 4
+    if knsc.numel() < n_out:
+        knsc = torch.nn.functional.pad(knsc, (0, n_out - knsc.numel()))
+    elif knsc.numel() > n_out:
+        knsc = knsc[:n_out]
+    return knsc
+
+
 def key_norms(plan, kv: torch.Tensor, flag: Optional[torch.Tensor] = None) -> None:
-    """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); a grid of a few programs an SM, so
-    a gated launch the call does not need costs little."""
+    """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); no-op if external kv_norms
+    were supplied."""
+    if plan.has_external_knsc:
+        return
     n_out = plan.knsc.numel()
     grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
     _key_norm_kernel[(grid,)](kv, plan.scales_or(kv), plan.knsc, kv.shape[0], n_out,
@@ -305,7 +385,7 @@ class _Plan:
     """Buffers and sample keys of one call's pruning plan (supports optional 3-way 16/24-col adaptive on SM100)."""
 
     def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, *,
-                 cols: int = PRUNE_COLUMNS, three_way: bool = False):
+                 cols: int = PRUNE_COLUMNS, three_way: bool = False, kv_norms: Optional[torch.Tensor] = None):
         num_q, _, dim = q.shape
         nk = kv.shape[0]
         dev = q.device
@@ -313,10 +393,13 @@ class _Plan:
         self.ncols = cols
         self.alloc_cols = PRUNE_COLS_24 if three_way else cols
         self.layout = 2 if torch.cuda.get_device_capability(dev)[0] == 9 else 1
-        group = 16 if self.layout == 2 else 2
+        group = 16
+        self.bf16 = kv_scales is None
         self.padded = triton.cdiv(num_q, group) * group
-        self.q_prune = torch.empty(self.padded * self.alloc_cols, dim, dtype=q.dtype, device=dev)
-        self.w_prune = torch.empty(num_q * self.alloc_cols, dtype=torch.float32, device=dev)
+        alloc_q_per_row = self._q_rows_per_q(self.alloc_cols)
+        alloc_w_cols = self._w_cols(self.alloc_cols)
+        self.q_prune = torch.empty(self.padded * alloc_q_per_row, dim, dtype=q.dtype, device=dev)
+        self.w_prune = torch.empty(num_q * alloc_w_cols, dtype=torch.float32, device=dev)
         self.allowance = torch.empty(num_q, dtype=torch.float32, device=dev)
         self.est_rows = estimate_rows(num_q)
         self.est = torch.empty(self.est_rows, EST_WORDS, dtype=torch.int32, device=dev)
@@ -325,24 +408,39 @@ class _Plan:
             origin = torch.zeros(num_q, dtype=torch.float32, device=dev)
             inv_delta = torch.zeros(num_q, dtype=torch.float32, device=dev)
             th_bucket = torch.zeros(num_q, dtype=torch.int32, device=dev)
-        # Padded to 4 floats, as the TMA of every per-key vector reads.
-        self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
         self.cols, picked = _plan_sample_cols(nk, dev.index)
         self.k_samples = kv[picked].contiguous()
-        self.bf16 = kv_scales is None
         if self.bf16:
-            self.s_samples = torch.ones(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
+            self.s_samples = launch.unit_scales(kv)[:_PLAN_SAMPLES]
         else:
             self.s_samples = kv_scales.reshape(-1)[picked].float().contiguous()
-        # The samples' scale * ||k||, by the kernel and arithmetic of the full table (knsc[picked]). The samples are
-        # gathered once here: a plan kernel reading them from their scattered rows took a fifth longer on SM90.
-        self.knsc_samples = torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
-        _key_norm_kernel[(triton.cdiv(_PLAN_SAMPLES, 64),)](
-            self.k_samples, self.s_samples, self.knsc_samples, _PLAN_SAMPLES, _PLAN_SAMPLES, self.knsc_samples,
-            BLOCK=64, GATED=False, HAS_SCALES=not self.bf16,
-        )
+        # Padded to 4 floats, as the TMA of every per-key vector reads.
+        if kv_norms is not None:
+            self.knsc = _prepare_external_kv_norms(kv_norms, nk)
+            self.knsc_samples = self.knsc[picked].contiguous()
+            self.has_external_knsc = True
+        else:
+            self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
+            self.has_external_knsc = False
+            # The samples' scale * ||k||, by the kernel and arithmetic of the full table (knsc[picked]). The samples are
+            # gathered once here: a plan kernel reading them from their scattered rows took a fifth longer on SM90.
+            self.knsc_samples = torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
+            _key_norm_kernel[(triton.cdiv(_PLAN_SAMPLES, 64),)](
+                self.k_samples, self.s_samples, self.knsc_samples, _PLAN_SAMPLES, _PLAN_SAMPLES, self.knsc_samples,
+                BLOCK=64, GATED=False, HAS_SCALES=not self.bf16,
+            )
         self.kv_scales = kv_scales
         self.args = (q, weights, ks, ke, origin, inv_delta, th_bucket)
+
+    def _has_lin(self, cols: int) -> bool:
+        return self.layout == 1 and not (self.bf16 and cols == PRUNE_COLS_24)
+
+    def _q_rows_per_q(self, cols: int) -> int:
+        return (cols + 2) if self._has_lin(cols) else cols
+
+    def _w_cols(self, cols: int) -> int:
+        # SM100 linear-term layouts append lin_scale_hi/lo and pad to multiple of 4 (20 for 16-col, 28 for FP8 24-col).
+        return (cols + 4) if self._has_lin(cols) else cols
 
     def rows(self, num_q: int, estimate: bool, flag: Optional[torch.Tensor], *,
              cols: Optional[int] = None, target_flag: int = 1, skip_est: bool = True, write_plan: bool = True) -> None:
@@ -351,15 +449,25 @@ class _Plan:
         q, weights, ks, ke, origin, inv_delta, th_bucket = self.args
         c = self.ncols if cols is None else cols
         est_buf = self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est
-        q_view = self.q_prune[: self.padded * c]
-        w_view = self.w_prune[: num_q * c].view(num_q, c)
-        _plan_kernel[(self.est_rows if estimate else self.padded,)](
+        q_view = self.q_prune[: self.padded * self._q_rows_per_q(c)]
+        wc = self._w_cols(c)
+        w_view = self.w_prune[: num_q * wc].view(num_q, wc)
+        total_pids = self.est_rows if estimate else self.padded
+        sms = launch.sm_count(q.device.index)
+        hoist_k = self.bf16
+        if hoist_k and not estimate:
+            grid = min(total_pids, 2 * sms)
+        elif flag is not None and not estimate:
+            grid = min(total_pids, 8 * sms)
+        else:
+            grid = total_pids
+        _plan_kernel[(grid,)](
             q, weights, self.k_samples, self.s_samples, self.knsc_samples, self.cols, ks, ke, origin, inv_delta,
             th_bucket, q_view, w_view, self.allowance, est_buf, ks if flag is None else flag,
-            num_q, self.padded, SCREEN_ROUNDING + _PLAN_ROUNDING, int(estimate), int(flag is not None),
+            num_q, self.padded, total_pids, SCREEN_ROUNDING + _PLAN_ROUNDING, int(estimate), int(flag is not None),
             estimate_stride(num_q), target_flag, int(skip_est), int(write_plan),
             H=q.shape[1], R=c - 2, S=_PLAN_SAMPLES, G=EST_GROUP, BF16=self.bf16,
-            LAYOUT=self.layout, num_warps=4, num_stages=1,
+            LAYOUT=self.layout, HOIST_K=hoist_k, num_warps=4, num_stages=1,
         )
 
     def scales_or(self, kv: torch.Tensor) -> torch.Tensor:
@@ -369,9 +477,10 @@ class _Plan:
     def operands(self, cols: Optional[int] = None):
         c = self.ncols if cols is None else cols
         num_q = self.args[0].shape[0]
+        wc = self._w_cols(c)
         return (
-            self.q_prune[: self.padded * c],
-            self.w_prune[: num_q * c].view(num_q, c),
+            self.q_prune[: self.padded * self._q_rows_per_q(c)],
+            self.w_prune[: num_q * wc].view(num_q, wc),
             self.allowance,
             self.knsc,
             self.est24 if (c == PRUNE_COLS_24 and self.est24 is not None) else self.est,
@@ -415,14 +524,14 @@ THREE_WAY_MIN_KEYS = 256 * 1024
 # groups' windows: estimate_shares' union). Keys are (device, dtype) for 16-col and (device, dtype, 24) for SM100
 # 24-col; a device not listed takes the entry of its architecture's ARCH_DEVICE.
 PRUNE_COSTS = {
-    ("B200", "fp8"): (0.1683, 0.5277, 1.7035),
-    ("B200", "bf16"): (0.1581, 0.5606, 1.8229),
-    ("B200", "fp8", 24): (0.0961, 0.8150, 1.7720),
-    ("B200", "bf16", 24): (0.0901, 0.8073, 1.9511),
-    ("GB300", "fp8"): (0.0162, 0.6059, 2.2516),
-    ("GB300", "bf16"): (0.0618, 0.6000, 2.0606),
-    ("GB300", "fp8", 24): (0.0387, 0.8690, 1.7092),
-    ("GB300", "bf16", 24): (0.0705, 0.8225, 1.6576),
+    ("B200", "fp8"): (0.1558, 0.4818, 1.7339),
+    ("B200", "bf16"): (0.0780, 0.5456, 3.3587),
+    ("B200", "fp8", 24): (0.0812, 0.7155, 2.8764),
+    ("B200", "bf16", 24): (0.0541, 0.7948, 3.2073),
+    ("GB300", "fp8"): (0.1299, 0.4913, 1.8580),
+    ("GB300", "bf16"): (0.0794, 0.6120, 2.2521),
+    ("GB300", "fp8", 24): (0.0757, 0.7723, 2.3509),
+    ("GB300", "bf16", 24): (0.0587, 0.8396, 2.2373),
     ("H800", "fp8"): (0.0262, 0.5296, 1.4184),
     ("H800", "bf16"): (0.0095, 0.5334, 1.3627),
     ("H20", "fp8"): (0.0272, 0.5098, 1.0018),
@@ -477,13 +586,15 @@ def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int, cols: int
 
 
 def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, flag, scan_ks, prune_ks,
-                      estimate=None, prune24_ks=None, *, use_eff_window: bool = False):
+                      estimate=None, prune24_ks=None, *, use_eff_window: bool = False,
+                      kv_norms: Optional[torch.Tensor] = None):
     """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) = 0 (scan), 1 (16-col
     pruning), or 2 (24-col pruning when ``prune24_ks`` is provided); ``scan_ks`` / ``prune_ks`` / ``prune24_ks``
     receive the row's own start on the chosen path and ``ke`` on the others."""
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
     three_way = prune24_ks is not None
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, three_way=three_way)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, three_way=three_way,
+                 kv_norms=kv_norms)
     plan.rows(num_q, True, None)
     if three_way:
         # Estimate-only pass for R=22: leaves the R=14 estimate rows intact in q_prune[:padded*16].
@@ -512,7 +623,7 @@ def adaptive_finish(plan, kv, flag):
 
 @torch.no_grad()
 def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None,
-                  cols: int = PRUNE_COLUMNS):
+                  cols: int = PRUNE_COLUMNS, kv_norms: Optional[torch.Tensor] = None):
     """``(q_prune, w_prune, allowance, knsc, est)`` for every row: the always-prune plan.
 
     ``q_prune`` (FP8 or BF16): per row the retained heads' rows of ``q``, then the aggregate's high and low rows, laid
@@ -522,7 +633,7 @@ def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None
     sample masks (``estimate_shares``).
     """
     num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, cols=cols)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, cols=cols, kv_norms=kv_norms)
     key_norms(plan, kv)
     plan.rows(num_q, False, None, cols=cols)
     return plan.operands(cols=cols)

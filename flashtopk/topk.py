@@ -29,7 +29,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from . import plan as planner
-from .kernels import launch
+from .kernels import graph_cond, launch
 from .kernels.common import HEAD_DIM, PRUNE_COLS_24
 from .kernels.selection import H_CAND_MAX, HEALTH_WORDS, RECOVERY_ROWS
 from .recovery import Recovery
@@ -208,6 +208,7 @@ class Selector:
         self._origin = torch.empty(max_rows, dtype=torch.float32, device=dev)
         self._inv_delta = torch.empty(max_rows, dtype=torch.float32, device=dev)
         self._th_bucket = torch.empty(max_rows, **i32)
+        self._th_bucket_scan = torch.empty(max_rows, **i32)
         self._cand_cnt = torch.empty(max_rows, **i32)
         self._lo = torch.empty(max_rows, **i32)
         self._hi = torch.empty(max_rows, **i32)
@@ -251,11 +252,13 @@ class Selector:
     @torch.no_grad()
     def run(self, q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor,
             kv_scales: Optional[torch.Tensor] = None,
-            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None
+            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+            *, kv_norms: Optional[torch.Tensor] = None,
             ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """(scores [num_q, topk] float32, indices [num_q, topk] int32) of q [num_q, 32, 128] against kv
         [seq_len_kv, 128] (FP8 with kv_scales [seq_len_kv] float32, or BF16), weights [num_q, 32] float32 and row
-        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices)."""
+        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices).
+        Pass ``kv_norms`` (from ``compute_kv_norms(kv, kv_scales)``) to reuse precomputed key norms across calls."""
         self._check(q, kv, weights, ks, ke, kv_scales)
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         rows = min(num_q, self.chunk_size)
@@ -277,7 +280,8 @@ class Selector:
             kv_scales = kv_scales.reshape(-1).contiguous()
         if num_q <= self.chunk_size:
             slice_scores = scores if self.return_scores else self._scores[:num_q]
-            self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices))
+            self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices,
+                                                  kv_norms=kv_norms))
             return result
 
         # Slices of chunk_size rows. Each slice's health is folded into the call's on the device (word H_CAND_MAX is
@@ -290,7 +294,7 @@ class Selector:
             b = min(num_q, a + self.chunk_size)
             slice_scores = scores[a:b] if self.return_scores else self._scores[:b - a]
             health, pruned, estimate = self._run_rows(q[a:b], kv, kv_scales, weights[a:b], ks[a:b], ke[a:b],
-                                                      slice_scores, indices[a:b])
+                                                      slice_scores, indices[a:b], kv_norms=kv_norms)
             cand_max = torch.maximum(total[H_CAND_MAX:H_CAND_MAX + 1], health[H_CAND_MAX:H_CAND_MAX + 1])
             total.add_(health)
             total[H_CAND_MAX:H_CAND_MAX + 1].copy_(cand_max)
@@ -301,7 +305,8 @@ class Selector:
         self.last_info = Info(total, pruned_any, estimate)
         return result
 
-    def _run_rows(self, q, kv, kv_scales, weights, ks, ke, scores, indices):
+    def _run_rows(self, q, kv, kv_scales, weights, ks, ke, scores, indices, *,
+                  kv_norms: Optional[torch.Tensor] = None):
         """One pass over at most chunk_size rows, writing their selection into scores and indices: (health, pruned,
         estimate) as Info takes them."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
@@ -323,7 +328,8 @@ class Selector:
             with torch.cuda.device(q.device), scope:
                 health.zero_()
                 launch.scan_dense(q, kv, kv_scales, weights, ks, ke, dense, cand_cnt)
-                launch.select_dense(dense, ks, ke, self._row_ids[:num_q], scores, indices)
+                launch.select_dense(dense, ks, ke, self._row_ids[:num_q], scores, indices,
+                                    write_scores=self.return_scores)
             return health, False, None
 
         sample = arena[: num_q * width].view(num_q, width)
@@ -331,6 +337,7 @@ class Selector:
         cand_idx = arena[num_q * cap: 2 * num_q * cap].view(torch.int32).view(num_q, cap)
         origin, inv_delta = self._origin[:num_q], self._inv_delta[:num_q]
         th_bucket = self._th_bucket[:num_q]
+        th_bucket_scan = self._th_bucket_scan[:num_q]
         lo, hi = self._lo[:num_q], self._hi[:num_q]
         seed_topk = min(topk + SEED_MARGIN, cap)
         slack = GATE_SLACK * topk
@@ -341,14 +348,16 @@ class Selector:
         with torch.cuda.device(q.device), scope:
             launch.sample_scores(q, kv, kv_scales, weights, ks, ke, num_samples, sample, cand_cnt, lo, hi, health,
                                  self._sample_kv, self._sample_scales)
-            launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
-                             th_bucket, cand_cnt)
+            with launch.scan_th_scope(th_bucket_scan):
+                launch.seed_prep(sample, ks, ke, lo, hi, seed_topk, slack, min(K_MIN, seed_topk), origin, inv_delta,
+                                 th_bucket, cand_cnt)
             gate = (origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt)
+            scan_gate = (origin, inv_delta, th_bucket_scan, cand_val, cand_idx, cand_cnt)
             if mode == "off":
-                launch.scan(q, kv, kv_scales, weights, ks, ke, *gate)
+                launch.scan(q, kv, kv_scales, weights, ks, ke, *scan_gate)
             elif mode == "always":
                 q_prune, w_prune, allowance, knsc, _ = planner.plan_operands(q, weights, kv, kv_scales, ks, ke, origin,
-                                                                             inv_delta, th_bucket)
+                                                                             inv_delta, th_bucket, kv_norms=kv_norms)
                 launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks, ke, *gate)
                 pruned = True
             else:
@@ -359,24 +368,70 @@ class Selector:
                 plan = planner.adaptive_estimate(
                     q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket,
                     self._flag, scan_ks, prune_ks, self._estimate, prune24_ks, use_eff_window=True,
+                    kv_norms=kv_norms,
                 )
                 estimate = self._estimate
-                launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *gate)
-                q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
-                if three_way:
-                    mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
-                                             origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
-                    q24, w24, _, _, _ = plan.operands(PRUNE_COLS_24)
-                    launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
-                                      origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
-                    launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
-                                        flag=self._flag, expected_flag=-1)
+                if graph_cond.is_capturing(q.device.index):
+                    # Pre-allocate/resolve buffers on the main capture stream so conditional child graphs allocate nothing.
+                    mask = torch.empty(launch.mask_shape(num_q, seq_len_kv), dtype=torch.int32, device=q.device)
+                    kv_sc_p = None if kv_scales is None else launch.padded_scales(kv_scales)
+                    if kv_sc_p is None:
+                        launch.unit_scales(kv)
+                    if launch.arch(q) == 9:
+                        launch.q_operand_sm90(q)
+                    q_prune, w_prune, allowance, knsc, _ = plan.operands()
+                    q24, w24 = (plan.operands(PRUNE_COLS_24)[:2] if three_way else (None, None))
+
+                    def _br_scan() -> None:
+                        launch.scan(q, kv, kv_sc_p, weights, scan_ks, ke, *scan_gate)
+
+                    def _br_prune16() -> None:
+                        planner.key_norms(plan, kv, self._flag)
+                        plan.rows(num_q, False, self._flag, target_flag=1, skip_est=True, write_plan=True)
+                        launch.prune_mask(q_prune, kv, kv_sc_p, knsc, w_prune, allowance, prune_ks, ke,
+                                          origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=1)
+                        launch.prune_refine(q, kv, kv_sc_p, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
+
+                    branches = [_br_scan, _br_prune16]
+                    if three_way:
+                        def _br_prune24() -> None:
+                            planner.key_norms(plan, kv, self._flag)
+                            plan.rows(num_q, False, self._flag, cols=PRUNE_COLS_24, target_flag=2, skip_est=False,
+                                      write_plan=True)
+                            launch.prune_mask(q24, kv, kv_sc_p, knsc, w24, allowance, prune24_ks, ke,
+                                              origin, inv_delta, th_bucket, mask=mask, flag=self._flag,
+                                              expected_flag=2)
+                            launch.prune_refine(q, kv, kv_sc_p, knsc, weights, mask, ks, ke, *gate,
+                                                flag=self._flag, expected_flag=2, block_q=8)
+
+                        branches.append(_br_prune24)
+                    graph_cond.switch_i32(self._flag, branches)
                 else:
-                    launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, prune_ks, ke, *gate,
-                                      flag=self._flag, expected_flag=1)
+                    launch.scan(q, kv, kv_scales, weights, scan_ks, ke, *scan_gate)
+                    q_prune, w_prune, allowance, knsc, _ = planner.adaptive_finish(plan, kv, self._flag)
+                    if three_way:
+                        mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                                 origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                        q24, w24, _, _, _ = plan.operands(PRUNE_COLS_24)
+                        launch.prune_mask(q24, kv, kv_scales, knsc, w24, allowance, prune24_ks, ke,
+                                          origin, inv_delta, th_bucket, mask=mask, flag=self._flag, expected_flag=2)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=2, block_q=8)
+                    else:
+                        mask = launch.prune_mask(q_prune, kv, kv_scales, knsc, w_prune, allowance, prune_ks, ke,
+                                                 origin, inv_delta, th_bucket, flag=self._flag, expected_flag=1)
+                        launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
+                                            flag=self._flag, expected_flag=1, block_q=16)
                 pruned = self._flag
-            launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows)
-            self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices)
+            th_select = th_bucket if mode == "always" else th_bucket_scan
+            with launch.select_gate_scope(origin, inv_delta, th_select):
+                launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows,
+                              write_scores=self.return_scores)
+            self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices,
+                               write_scores=self.return_scores)
         return health, pruned, estimate
 
 
@@ -386,7 +441,8 @@ _SELECTORS: dict = {}
 def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor,
            kv_scales: Optional[torch.Tensor] = None, topk: int = 2048, pruning: Optional[str] = None,
            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None, chunk_size: Optional[int] = None,
-           return_scores: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+           return_scores: bool = False, *, kv_norms: Optional[torch.Tensor] = None
+           ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Selector(...).run(...) with a selector kept per (device, dtype, topk, pruning, chunk_size, return_scores), its
     workspace grown to the largest call seen."""
     key = (q.device, q.dtype, topk, pruning, chunk_size, return_scores)
@@ -394,4 +450,4 @@ def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.T
     if selector is None:
         selector = _SELECTORS[key] = Selector(topk, dtype=q.dtype, device=q.device, pruning=pruning,
                                               chunk_size=chunk_size, return_scores=return_scores)
-    return selector.run(q, kv, weights, ks, ke, kv_scales, out)
+    return selector.run(q, kv, weights, ks, ke, kv_scales, out, kv_norms=kv_norms)

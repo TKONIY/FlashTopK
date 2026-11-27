@@ -20,13 +20,13 @@ import math
 
 import torch
 
-from .kernels import launch
+from .kernels import graph_cond, launch
 from .kernels.common import HEAD_DIM, NEXT_N, NUM_HEADS
 from .kernels.selection import RECOVERY_ROWS
 
 SPLIT_MIN_KEYS = 32768
-SPLIT_KEYS = 16384
-MAX_SPLITS = 64
+SPLIT_KEYS = 32768
+MAX_SPLITS = 32
 
 
 def recovery_splits(seq_len_kv: int) -> int:
@@ -68,31 +68,73 @@ class Recovery:
         self.stage_scores = torch.empty(stage_rows, topk, dtype=torch.float32, device=dev)
         self.stage_indices = torch.empty(stage_rows, topk, **i32)
 
-    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices) -> None:
+    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices,
+            write_scores: bool = True) -> None:
         """Enqueue the recovery of this call's selection (scores / indices, its health and bad-row table)."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         sm90 = launch.arch(q) == 9
-        launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
-                      self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
-
-        # per-row: the gathered slots
-        dense = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
+        dense_per = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
         q_slots = self.q_gather.view(q.dtype).view(RECOVERY_ROWS, NUM_HEADS, HEAD_DIM)
-        operand = launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None
-        launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense,
-                          self.scratch[:RECOVERY_ROWS], q_operand=operand)
+        operand_per = launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None
+        rec_min_splits = min(launch.sm_count(q.device.index), max(1, math.ceil(seq_len_kv / 1024)))
         splits = min(self.max_splits, recovery_splits(seq_len_kv))
-        if splits > 1:
-            stage = RECOVERY_ROWS * splits
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
-                                self.stage_indices[:stage], splits)
-            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices)
-        else:
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices)
-
-        # whole call, `chunk` rows at a time
         chunk = dense_rows(self.arena.numel(), seq_len_kv, num_q)
         full_operand = launch.q_operand_sm90(q) if sm90 else None
+
+        # Pre-resolve cached/padded buffers on the main stream so CUDA Graph conditional branches allocate nothing.
+        if kv_scales is None:
+            launch.unit_scales(kv)
+        else:
+            kv_scales = launch.padded_scales(kv_scales)
+        launch._unused_health(q.device.index)
+
+        def _run_per_row() -> None:
+            launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
+                          self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
+            launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense_per,
+                              self.scratch[:RECOVERY_ROWS], q_operand=operand_per, min_splits=rec_min_splits)
+            if splits > 1:
+                stage = RECOVERY_ROWS * splits
+                launch.select_dense(dense_per, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
+                                    self.stage_indices[:stage], splits, write_scores=True)
+                launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores,
+                                     indices, write_scores=write_scores)
+            else:
+                launch.select_dense(dense_per, self.slot_ks, self.slot_ke, self.row_map, scores, indices,
+                                    write_scores=write_scores)
+
+        def _run_whole_call() -> None:
+            launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
+                          self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
+            for off in range(0, num_q, chunk):
+                rows = min(chunk, num_q - off)
+                dense = self.arena[: rows * seq_len_kv].view(rows, seq_len_kv)
+                part = slice(off, off + rows)
+                operand = None
+                if sm90:
+                    operand = full_operand[off * NUM_HEADS: (off + math.ceil(rows / NEXT_N) * NEXT_N) * NUM_HEADS]
+                launch.scan_dense(q[part], kv, kv_scales, weights[part], self.whole_ks[part], self.whole_ke[part],
+                                  dense, self.scratch[:rows], q_operand=operand)
+                launch.select_dense(dense, self.whole_ks[part], self.whole_ke[part], self.whole_map[part], scores,
+                                    indices, write_scores=write_scores)
+
+        if graph_cond.recovery_switch(health, _run_per_row, _run_whole_call):
+            return
+
+        # Eager mode (not capturing a CUDA Graph): device-gated recovery with zero host sync.
+        launch.triage(health, bad_rows, ks, ke, q, weights, self.row_map, self.slot_ks, self.slot_ke, self.q_gather,
+                      self.w_gather, self.whole_map[:num_q], self.whole_ks[:num_q], self.whole_ke[:num_q])
+        launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense_per,
+                          self.scratch[:RECOVERY_ROWS], q_operand=operand_per, min_splits=rec_min_splits)
+        if splits > 1:
+            stage = RECOVERY_ROWS * splits
+            launch.select_dense(dense_per, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
+                                self.stage_indices[:stage], splits, write_scores=True)
+            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices,
+                                 write_scores=write_scores)
+        else:
+            launch.select_dense(dense_per, self.slot_ks, self.slot_ke, self.row_map, scores, indices,
+                                write_scores=write_scores)
         for off in range(0, num_q, chunk):
             rows = min(chunk, num_q - off)
             dense = self.arena[: rows * seq_len_kv].view(rows, seq_len_kv)
@@ -103,4 +145,4 @@ class Recovery:
             launch.scan_dense(q[part], kv, kv_scales, weights[part], self.whole_ks[part], self.whole_ke[part], dense,
                               self.scratch[:rows], q_operand=operand)
             launch.select_dense(dense, self.whole_ks[part], self.whole_ke[part], self.whole_map[part], scores,
-                                indices)
+                                indices, write_scores=write_scores)

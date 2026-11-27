@@ -181,3 +181,31 @@ def test_select_fast_and_edge_cases():
         # Compare against canonical_topk over finite entries (matching Select's finite-only contract).
         ref_in = torch.where(torch.isfinite(scores), scores, torch.tensor(float("-inf"), device="cuda"))
         assert_same((out_s, out_i), canonical_topk(ref_in, k))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("pruning", ["always", "adaptive"])
+def test_kv_norms_reuse(dtype, pruning):
+    """Precomputed kv_norms skip _key_norm_kernel and match bit-for-bit across non-multiple-of-4 KV lengths."""
+    seq_len_kv = 140003 if pruning == "adaptive" else 20003
+    rows = 515 if pruning == "adaptive" else 65
+    q, kv, s, w, ks, ke = make_call(rows, seq_len_kv, dtype, seed=19)
+    knsc = flashtopk.compute_kv_norms(kv, s)
+    assert knsc.dtype == torch.float32 and knsc.numel() == (seq_len_kv + 3) // 4 * 4
+    ref = flashtopk.select(q, kv, w, ks, ke, s, topk=TOPK, pruning=pruning, return_scores=True)
+    got_padded = flashtopk.select(q, kv, w, ks, ke, s, topk=TOPK, pruning=pruning, return_scores=True, kv_norms=knsc)
+    # Also verify unpadded slice [seq_len_kv] is auto-padded cleanly.
+    got_unpadded = flashtopk.select(q, kv, w, ks, ke, s, topk=TOPK, pruning=pruning, return_scores=True,
+                                    kv_norms=knsc[:seq_len_kv])
+    assert_same(got_padded, ref)
+    assert_same(got_unpadded, ref)
+    with pytest.raises(ValueError, match="kv_norms"):
+        flashtopk.select(q, kv, w, ks, ke, s, topk=TOPK, pruning=pruning, kv_norms=knsc[:16])
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_refine16_exact(dtype):
+    """16-row Refine16Sm100 (triggered at seq_len_kv >= 256K) matches exact canonical top-k on non-multiple rows."""
+    q, kv, s, w, ks, ke = make_call(33, 262144, dtype, seed=23)
+    got = flashtopk.Selector(TOPK, dtype=dtype, pruning="always", return_scores=True).run(q, kv, w, ks, ke, s)
+    assert_same(got, canonical_topk(dense_scores(q, kv, s, w, ks, ke)))
