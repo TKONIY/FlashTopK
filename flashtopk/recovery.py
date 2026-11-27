@@ -68,7 +68,8 @@ class Recovery:
         self.stage_scores = torch.empty(stage_rows, topk, dtype=torch.float32, device=dev)
         self.stage_indices = torch.empty(stage_rows, topk, **i32)
 
-    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices) -> None:
+    def run(self, q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices,
+            write_scores: bool = True) -> None:
         """Enqueue the recovery of this call's selection (scores / indices, its health and bad-row table)."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         sm90 = launch.arch(q) == 9
@@ -86,10 +87,12 @@ class Recovery:
         if splits > 1:
             stage = RECOVERY_ROWS * splits
             launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, self.stage_scores[:stage],
-                                self.stage_indices[:stage], splits)
-            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices)
+                                self.stage_indices[:stage], splits, write_scores=True)
+            launch.select_staged(self.stage_scores[:stage], self.stage_indices[:stage], self.row_map, scores, indices,
+                                 write_scores=write_scores)
         else:
-            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices)
+            launch.select_dense(dense, self.slot_ks, self.slot_ke, self.row_map, scores, indices,
+                                write_scores=write_scores)
 
         # whole call, `chunk` rows at a time
         chunk = dense_rows(self.arena.numel(), seq_len_kv, num_q)
@@ -104,4 +107,4 @@ class Recovery:
             launch.scan_dense(q[part], kv, kv_scales, weights[part], self.whole_ks[part], self.whole_ke[part], dense,
                               self.scratch[:rows], q_operand=operand)
             launch.select_dense(dense, self.whole_ks[part], self.whole_ke[part], self.whole_map[part], scores,
-                                indices)
+                                indices, write_scores=write_scores)

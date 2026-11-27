@@ -93,6 +93,37 @@ def select_i32(predicate, true_value, false_value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def select_u32(predicate, true_value, false_value, *, loc=None, ip=None):
+    return cutlass.Uint32(
+        arith.select(
+            cutlass.Boolean(predicate).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(true_value).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(false_value).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ctz_u32(x, *, loc=None, ip=None) -> Int32:
+    """Count trailing zeros of nonzero uint32 x (2 PTX ops: brev + clz)."""
+    return Int32(
+        llvm.inline_asm(
+            Int32.mlir_type,
+            [cutlass.Uint32(x).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 r; brev.b32 r, $1; clz.b32 $0, r; }",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def fp32_to_i32_bits(value, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.bitcast(Int32.mlir_type, Float32(value).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 

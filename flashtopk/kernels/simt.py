@@ -122,6 +122,22 @@ def fence_gpu(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def cp_async_bulk_prefetch_l2(address, num_bytes, *, loc=None, ip=None) -> None:
+    """Prefetch a 16-byte aligned global region into L2 (SM90+ / SM100+ PTX 8.0+)."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(address).ir_value(loc=loc, ip=ip), Int32(num_bytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.bulk.prefetch.L2.global [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def store_shared_v4_b32(smem_addr, v0, v1, v2, v3, *, loc=None, ip=None) -> None:
     """One 16-byte shared-memory vector store."""
     llvm.inline_asm(
@@ -262,6 +278,31 @@ def block_max_f32(value, sScratch, tid) -> Float32:
         m = fmax(m, sScratch[w])
     cute.arch.sync_threads()
     return m
+
+
+@cute.jit
+def block_reduce_fin_minmax(fin, lo_s, hi_s, sScan, sScanF, tid):
+    """Fused block-wide (sum_i32, min_f32, max_f32) in a single CTA barrier (sScanF holds 2 * WARPS floats)."""
+    f = cute.arch.warp_reduction_sum(fin)
+    lo = lo_s
+    hi = hi_s
+    for off in cutlass.range_constexpr(5):
+        lo = fmin(lo, cute.arch.shuffle_sync_bfly(lo, 1 << off))
+        hi = fmax(hi, cute.arch.shuffle_sync_bfly(hi, 1 << off))
+    warp = tid // 32
+    if tid % 32 == 0:
+        sScan[warp] = f
+        sScanF[warp] = lo
+        sScanF[WARPS + warp] = hi
+    cute.arch.sync_threads()
+    total = sScan[0]
+    worst = sScanF[0]
+    best = sScanF[WARPS]
+    for w in cutlass.range_constexpr(1, WARPS):
+        total = total + sScan[w]
+        worst = fmin(worst, sScanF[w])
+        best = fmax(best, sScanF[WARPS + w])
+    return total, worst, best
 
 
 @cute.jit

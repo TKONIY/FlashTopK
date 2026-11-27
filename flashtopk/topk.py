@@ -324,7 +324,8 @@ class Selector:
             with torch.cuda.device(q.device), scope:
                 health.zero_()
                 launch.scan_dense(q, kv, kv_scales, weights, ks, ke, dense, cand_cnt)
-                launch.select_dense(dense, ks, ke, self._row_ids[:num_q], scores, indices)
+                launch.select_dense(dense, ks, ke, self._row_ids[:num_q], scores, indices,
+                                    write_scores=self.return_scores)
             return health, False, None
 
         sample = arena[: num_q * width].view(num_q, width)
@@ -383,8 +384,12 @@ class Selector:
                     launch.prune_refine(q, kv, kv_scales, knsc, weights, mask, ks, ke, *gate,
                                         flag=self._flag, expected_flag=1, block_q=16)
                 pruned = self._flag
-            launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows)
-            self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices)
+            th_select = th_bucket if mode == "always" else th_bucket_scan
+            with launch.select_gate_scope(origin, inv_delta, th_select):
+                launch.select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows,
+                              write_scores=self.return_scores)
+            self._recovery.run(q, kv, kv_scales, weights, ks, ke, health, bad_rows, scores, indices,
+                               write_scores=self.return_scores)
         return health, pruned, estimate
 
 

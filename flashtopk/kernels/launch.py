@@ -694,18 +694,34 @@ def seed_prep(sample, ks, ke, col_lo, col_hi, topk: int, slack_topk: float, k_mi
                          sample.shape[0], topk, slack_topk, k_min)
 
 
+_SELECT_GATE: contextvars.ContextVar = contextvars.ContextVar("flashtopk_select_gate", default=None)
+
+
+@contextlib.contextmanager
+def select_gate_scope(origin: torch.Tensor, inv_delta: torch.Tensor, th_bucket: torch.Tensor):
+    """Provide calibrated (origin, inv_delta, th_bucket) to `select` for the 1-pass FP32-log fast path."""
+    token = _SELECT_GATE.set((origin, inv_delta, th_bucket))
+    try:
+        yield
+    finally:
+        _SELECT_GATE.reset(token)
+
+
 @functools.cache
-def _compile_select(topk: int, source: int):
+def _compile_select(topk: int, source: int, write_scores: bool = True, has_gate: bool = False):
     rows, cap, slots, out_rows = (cute.sym_int() for _ in range(4))
     vec = (rows,)
     return cute.compile(
-        Select(topk, source),
+        Select(topk, source, write_scores=write_scores, has_gate=has_gate),
         make_fake_tensor(Float32, (rows, cap)),
         make_fake_tensor(Int32, (rows, cap)),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, vec),
         make_fake_tensor(Int32, (slots,)),
+        make_fake_tensor(Float32, vec),
+        make_fake_tensor(Float32, vec),
+        make_fake_tensor(Int32, vec),
         make_fake_tensor(Float32, (out_rows, topk)),
         make_fake_tensor(Int32, (out_rows, topk)),
         make_fake_tensor(cutlass.Int64, (HEALTH_WORDS,)),
@@ -725,30 +741,47 @@ def _unused_health(device_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
             torch.zeros(RECOVERY_ROWS, dtype=torch.int32, device=device))
 
 
-def select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows, stats: bool = False) -> None:
+def select(cand_val, cand_idx, cand_cnt, ks, ke, scores, indices, health, bad_rows, stats: bool = False,
+           write_scores: bool = True) -> None:
     """Each row's exact top-k of its candidates into scores / indices in canonical order (score descending, index
     ascending; -inf / -1 padding last), accumulating the call's health and recording its first bad rows."""
-    _compile_select(scores.shape[1], CANDIDATES)(cand_val, cand_idx, cand_cnt, ks, ke, cand_cnt, scores, indices,
-                                                 health, bad_rows, cand_val.shape[0], 1, int(stats))
+    gate = _SELECT_GATE.get()
+    if gate is not None and gate[0].shape[0] == cand_val.shape[0]:
+        origin, inv_delta, th_bucket = gate
+        has_gate = True
+    else:
+        origin = inv_delta = cand_cnt.view(torch.float32)
+        th_bucket = cand_cnt
+        has_gate = False
+    _compile_select(scores.shape[1], CANDIDATES, write_scores, has_gate)(
+        cand_val, cand_idx, cand_cnt, ks, ke, cand_cnt, origin, inv_delta, th_bucket, scores, indices, health,
+        bad_rows, cand_val.shape[0], 1, int(stats),
+    )
 
 
-def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1) -> None:
+def select_dense(dense, ks, ke, row_map, scores, indices, splits: int = 1, write_scores: bool = True) -> None:
     """Recovery: slot s's exact top-k over its window [ks[s], ke[s]) of dense[s] (the index is the column), in
     canonical order, to row row_map[s] of scores / indices; slots mapped to -1 are skipped. With splits > 1 each slot
     is cut into that many slices, and slice p of slot s writes its own top-k to row s * splits + p of the stage
     buffers scores / indices instead (select_staged finishes)."""
     health, bad_rows = _unused_health(dense.device.index)
-    _compile_select(scores.shape[1], DENSE)(dense, dense.view(torch.int32), ks, ks, ke, row_map, scores, indices,
-                                            health, bad_rows, dense.shape[0] * splits, splits, 0)
+    dummy_f = ks.view(torch.float32)
+    _compile_select(scores.shape[1], DENSE, write_scores, False)(
+        dense, dense.view(torch.int32), ks, ks, ke, row_map, dummy_f, dummy_f, ks, scores, indices, health, bad_rows,
+        dense.shape[0] * splits, splits, 0,
+    )
 
 
-def select_staged(stage_scores, stage_indices, row_map, scores, indices) -> None:
+def select_staged(stage_scores, stage_indices, row_map, scores, indices, write_scores: bool = True) -> None:
     """Recovery's second stage: slot s's exact top-k over its slices' selections (stage rows s * splits ... s * splits
     + splits - 1), to row row_map[s] of scores / indices."""
     health, bad_rows = _unused_health(stage_scores.device.index)
     slots = row_map.shape[0]
-    _compile_select(scores.shape[1], STAGED)(stage_scores.view(slots, -1), stage_indices.view(slots, -1), row_map,
-                                             row_map, row_map, row_map, scores, indices, health, bad_rows, slots, 1, 0)
+    dummy_f = row_map.view(torch.float32)
+    _compile_select(scores.shape[1], STAGED, write_scores, False)(
+        stage_scores.view(slots, -1), stage_indices.view(slots, -1), row_map, row_map, row_map, row_map,
+        dummy_f, dummy_f, row_map, scores, indices, health, bad_rows, slots, 1, 0,
+    )
 
 
 @functools.cache
@@ -811,7 +844,10 @@ def warmup(arch_major: int, bf16: bool, topk: int, words_per_head: int) -> None:
         _compile_decide(True, True)
     _compile_seed_prep()
     for source in (CANDIDATES, DENSE, STAGED):
-        _compile_select(topk, source)
+        for write_scores in (False, True):
+            _compile_select(topk, source, write_scores, False)
+            if source == CANDIDATES:
+                _compile_select(topk, source, write_scores, True)
     _compile_triage(words_per_head, arch_major == 9)
 
 
