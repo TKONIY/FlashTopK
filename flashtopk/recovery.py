@@ -25,8 +25,8 @@ from .kernels.common import HEAD_DIM, NEXT_N, NUM_HEADS
 from .kernels.selection import RECOVERY_ROWS
 
 SPLIT_MIN_KEYS = 32768
-SPLIT_KEYS = 16384
-MAX_SPLITS = 64
+SPLIT_KEYS = 32768
+MAX_SPLITS = 32
 
 
 def recovery_splits(seq_len_kv: int) -> int:
@@ -79,8 +79,9 @@ class Recovery:
         dense = self.arena[: RECOVERY_ROWS * seq_len_kv].view(RECOVERY_ROWS, seq_len_kv)
         q_slots = self.q_gather.view(q.dtype).view(RECOVERY_ROWS, NUM_HEADS, HEAD_DIM)
         operand = launch.as_operand(q_slots).view(-1, HEAD_DIM, 1) if sm90 else None
+        rec_min_splits = min(launch.sm_count(q.device.index), max(1, math.ceil(seq_len_kv / 1024)))
         launch.scan_dense(q_slots, kv, kv_scales, self.w_gather, self.slot_ks, self.slot_ke, dense,
-                          self.scratch[:RECOVERY_ROWS], q_operand=operand)
+                          self.scratch[:RECOVERY_ROWS], q_operand=operand, min_splits=rec_min_splits)
         splits = min(self.max_splits, recovery_splits(seq_len_kv))
         if splits > 1:
             stage = RECOVERY_ROWS * splits

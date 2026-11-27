@@ -83,9 +83,9 @@ def scan_kv_splits(num_q: int, seq_len_kv: int, sm_count: int) -> int:
 def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int, int, int]:
     """Return ``(num_splits, full_tiles, tail_chunks)`` for ScanSm100.
 
-    When query tiles exceed one wave (up to 8 full waves) and leave a partial tail wave, keep full waves
-    single-split (register cursor, zero atomics) and split only the tail tiles across KV in ``tail_chunks`` pieces
-    so the last wave fills the GPU. Otherwise fall back to uniform ``scan_kv_splits``.
+    When query tiles exceed one wave and leave a partial tail wave, keep full waves single-split
+    (register cursor, zero atomics) and split only the tail tiles across KV in ``tail_chunks``
+    pieces so the last wave fills the GPU. Otherwise fall back to uniform ``scan_kv_splits``.
     """
     num_tiles = math.ceil(num_q / NEXT_N)
     if num_tiles < sm_count:
@@ -93,10 +93,10 @@ def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int,
     full_waves = num_tiles // sm_count
     tail = num_tiles % sm_count
     total_kv_blocks = math.ceil(seq_len_kv / BLOCK_KV)
-    if tail == 0 or full_waves > 8 or total_kv_blocks < 16:
+    if tail == 0 or total_kv_blocks < 16:
         return 1, num_tiles, 1
-    # Fixed setup/tail overhead of splitting a tile in units of 128-key blocks.
-    unit_overhead = 8.0 / total_kv_blocks
+    # Persistent CTAs hide Q/W setup behind double-buffering, leaving tiny per-piece overhead.
+    unit_overhead = 2.0 / total_kv_blocks
 
     def cost(c: int) -> float:
         if c == 1:
@@ -105,7 +105,7 @@ def pick_scan_schedule(num_q: int, seq_len_kv: int, sm_count: int) -> Tuple[int,
         return full_waves + tail_waves / c + tail_waves * unit_overhead
 
     candidates = [1]
-    for c in (2, 4, 8):
+    for c in (2, 3, 4, 5, 6, 8):
         if total_kv_blocks // c >= 8:
             candidates.append(c)
     best_c = min(candidates, key=cost)
@@ -202,15 +202,20 @@ def _compile_scan_sm100(single_split: bool, bf16: bool, dense: bool):
 
 
 def _scan_sm100(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-                dense: bool, q_operand=None):
+                dense: bool, q_operand=None, min_splits: int = 1):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
-    num_splits, full_tiles, tail_chunks = pick_scan_schedule(num_q, seq_len_kv, sm_count(q.device.index))
+    sms = sm_count(q.device.index)
+    if dense and min_splits > 1:
+        num_tiles = math.ceil(num_q / NEXT_N)
+        num_splits, full_tiles, tail_chunks = max(scan_kv_splits(num_q, seq_len_kv, sms), min_splits), num_tiles, 1
+    else:
+        num_splits, full_tiles, tail_chunks = pick_scan_schedule(num_q, seq_len_kv, sms)
     bf16 = kv_scales is None
     scales = unit_scales(kv) if bf16 else padded_scales(kv_scales)
     single_split = num_splits == 1 and tail_chunks == 1 and not dense
     _compile_scan_sm100(single_split, bf16, dense)(
-        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights, scales, ks, ke, origin, inv_delta,
-        th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, num_splits, full_tiles, tail_chunks,
+        as_operand(kv), as_operand(q).view(num_q * NUM_HEADS, HEAD_DIM, 1), weights, scales, ks, ke, origin,
+        inv_delta, th_bucket, cand_val, cand_idx, cand_cnt, num_q, seq_len_kv, num_splits, full_tiles, tail_chunks,
     )
 
 
@@ -338,9 +343,9 @@ def _compile_scan_sm90(bf16: bool, single_split: bool, dense: bool):
 
 
 def _scan_sm90(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_val, cand_idx, cand_cnt,
-               dense: bool, q_operand=None):
+               dense: bool, q_operand=None, min_splits: int = 1):
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
-    num_splits = scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index))
+    num_splits = max(scan_kv_splits(num_q, seq_len_kv, sm_count(q.device.index)), min_splits if dense else 1)
     bf16 = kv_scales is None
     scales = unit_scales(kv) if bf16 else padded_scales(kv_scales)
     _compile_scan_sm90(bf16, num_splits == 1 and not dense, dense)(
@@ -484,7 +489,7 @@ def scan(q, kv, kv_scales, weights, ks, ke, origin, inv_delta, th_bucket, cand_v
 
 
 def scan_dense(q, kv, kv_scales, weights, ks, ke, out: torch.Tensor, scratch: torch.Tensor,
-               q_operand: Optional[torch.Tensor] = None) -> None:
+               q_operand: Optional[torch.Tensor] = None, min_splits: int = 1) -> None:
     """out[r, key] = row r's score of every key of its window [ks[r], ke[r]), in the scan's bits; other entries are
     left as they were. scratch: any [num_q] 4-byte tensor (the gate's inputs, read and unused). On SM90 q_operand,
     when given, is q's operand already laid out (q_operand_sm90)."""
@@ -492,7 +497,7 @@ def scan_dense(q, kv, kv_scales, weights, ks, ke, out: torch.Tensor, scratch: to
     bucket = scratch.view(torch.int32)
     run = _scan_sm90 if arch(q) == 9 else _scan_sm100
     run(q, kv, kv_scales, weights, ks, ke, gate, gate, bucket, out, out.view(torch.int32), bucket, dense=True,
-        q_operand=q_operand)
+        q_operand=q_operand, min_splits=min_splits)
 
 
 def prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks, ke, origin, inv_delta, th_bucket,
