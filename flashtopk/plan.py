@@ -336,9 +336,37 @@ def _key_norm_kernel(KV, SCALES, OUT, n, n_out, FLAG, BLOCK: tl.constexpr, GATED
         tl.store(OUT + i, tl.where(valid, norm * (1.0 + 2.0**-20), 0.0), mask=i < n_out)
 
 
+@torch.no_grad()
+def compute_kv_norms(kv: torch.Tensor, kv_scales: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Precompute ``scale * ||k|| * (1 + 2^-20)`` (4-float padded float32) for reuse across calls sharing ``kv``."""
+    kv = kv.contiguous()
+    nk = kv.shape[0]
+    n_out = (nk + 3) // 4 * 4
+    out = torch.empty(n_out, dtype=torch.float32, device=kv.device)
+    has_scales = kv_scales is not None
+    scales = kv_scales.reshape(-1).contiguous() if has_scales else out
+    grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
+    _key_norm_kernel[(grid,)](kv, scales, out, nk, n_out, out, BLOCK=64, GATED=False, HAS_SCALES=has_scales)
+    return out
+
+
+def _prepare_external_kv_norms(kv_norms: torch.Tensor, seq_len_kv: int) -> torch.Tensor:
+    knsc = kv_norms.reshape(-1).contiguous()
+    if knsc.dtype != torch.float32 or knsc.numel() < seq_len_kv:
+        raise ValueError(f"kv_norms must be float32 of at least {seq_len_kv} elements, got {knsc.dtype} {tuple(kv_norms.shape)}")
+    n_out = (seq_len_kv + 3) // 4 * 4
+    if knsc.numel() < n_out:
+        knsc = torch.nn.functional.pad(knsc, (0, n_out - knsc.numel()))
+    elif knsc.numel() > n_out:
+        knsc = knsc[:n_out]
+    return knsc
+
+
 def key_norms(plan, kv: torch.Tensor, flag: Optional[torch.Tensor] = None) -> None:
-    """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); a grid of a few programs an SM, so
-    a gated launch the call does not need costs little."""
+    """plan.knsc = scale * ||k|| of every key (only when flag is set, given one); no-op if external kv_norms
+    were supplied."""
+    if plan.has_external_knsc:
+        return
     n_out = plan.knsc.numel()
     grid = min(triton.cdiv(n_out, 64), 8 * launch.sm_count(kv.device.index))
     _key_norm_kernel[(grid,)](kv, plan.scales_or(kv), plan.knsc, kv.shape[0], n_out,
@@ -357,7 +385,7 @@ class _Plan:
     """Buffers and sample keys of one call's pruning plan (supports optional 3-way 16/24-col adaptive on SM100)."""
 
     def __init__(self, q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, *,
-                 cols: int = PRUNE_COLUMNS, three_way: bool = False):
+                 cols: int = PRUNE_COLUMNS, three_way: bool = False, kv_norms: Optional[torch.Tensor] = None):
         num_q, _, dim = q.shape
         nk = kv.shape[0]
         dev = q.device
@@ -387,14 +415,20 @@ class _Plan:
         else:
             self.s_samples = kv_scales.reshape(-1)[picked].float().contiguous()
         # Padded to 4 floats, as the TMA of every per-key vector reads.
-        self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
-        # The samples' scale * ||k||, by the kernel and arithmetic of the full table (knsc[picked]). The samples are
-        # gathered once here: a plan kernel reading them from their scattered rows took a fifth longer on SM90.
-        self.knsc_samples = torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
-        _key_norm_kernel[(triton.cdiv(_PLAN_SAMPLES, 64),)](
-            self.k_samples, self.s_samples, self.knsc_samples, _PLAN_SAMPLES, _PLAN_SAMPLES, self.knsc_samples,
-            BLOCK=64, GATED=False, HAS_SCALES=not self.bf16,
-        )
+        if kv_norms is not None:
+            self.knsc = _prepare_external_kv_norms(kv_norms, nk)
+            self.knsc_samples = self.knsc[picked].contiguous()
+            self.has_external_knsc = True
+        else:
+            self.knsc = torch.empty((nk + 3) // 4 * 4, dtype=torch.float32, device=dev)
+            self.has_external_knsc = False
+            # The samples' scale * ||k||, by the kernel and arithmetic of the full table (knsc[picked]). The samples are
+            # gathered once here: a plan kernel reading them from their scattered rows took a fifth longer on SM90.
+            self.knsc_samples = torch.empty(_PLAN_SAMPLES, dtype=torch.float32, device=dev)
+            _key_norm_kernel[(triton.cdiv(_PLAN_SAMPLES, 64),)](
+                self.k_samples, self.s_samples, self.knsc_samples, _PLAN_SAMPLES, _PLAN_SAMPLES, self.knsc_samples,
+                BLOCK=64, GATED=False, HAS_SCALES=not self.bf16,
+            )
         self.kv_scales = kv_scales
         self.args = (q, weights, ks, ke, origin, inv_delta, th_bucket)
 
@@ -552,13 +586,15 @@ def adaptive_threshold(device_index: int, bf16: bool, seq_len_kv: int, cols: int
 
 
 def adaptive_estimate(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, flag, scan_ks, prune_ks,
-                      estimate=None, prune24_ks=None, *, use_eff_window: bool = False):
+                      estimate=None, prune24_ks=None, *, use_eff_window: bool = False,
+                      kv_norms: Optional[torch.Tensor] = None):
     """The plan of the estimate groups' rows, then the GPU's choice: ``flag`` (int32[1]) = 0 (scan), 1 (16-col
     pruning), or 2 (24-col pruning when ``prune24_ks`` is provided); ``scan_ks`` / ``prune_ks`` / ``prune24_ks``
     receive the row's own start on the chosen path and ``ke`` on the others."""
     num_q, seq_len_kv = q.shape[0], kv.shape[0]
     three_way = prune24_ks is not None
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, three_way=three_way)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, three_way=three_way,
+                 kv_norms=kv_norms)
     plan.rows(num_q, True, None)
     if three_way:
         # Estimate-only pass for R=22: leaves the R=14 estimate rows intact in q_prune[:padded*16].
@@ -587,7 +623,7 @@ def adaptive_finish(plan, kv, flag):
 
 @torch.no_grad()
 def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None, th_bucket=None,
-                  cols: int = PRUNE_COLUMNS):
+                  cols: int = PRUNE_COLUMNS, kv_norms: Optional[torch.Tensor] = None):
     """``(q_prune, w_prune, allowance, knsc, est)`` for every row: the always-prune plan.
 
     ``q_prune`` (FP8 or BF16): per row the retained heads' rows of ``q``, then the aggregate's high and low rows, laid
@@ -597,7 +633,7 @@ def plan_operands(q, weights, kv, kv_scales, ks, ke, origin=None, inv_delta=None
     sample masks (``estimate_shares``).
     """
     num_q = q.shape[0]
-    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, cols=cols)
+    plan = _Plan(q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket, cols=cols, kv_norms=kv_norms)
     key_norms(plan, kv)
     plan.rows(num_q, False, None, cols=cols)
     return plan.operands(cols=cols)

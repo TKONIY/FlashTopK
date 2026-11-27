@@ -8,8 +8,9 @@ or flashtopk.select(...) for the same with a cached selector. See topk.py for th
 """
 
 from . import ops  # registers torch.ops.flashtopk.select
+from .plan import compute_kv_norms
 from .topk import DEFAULT_CHUNK_SIZE, Info, Selector, select, supported, windows_from_cu_seqlens, workspace_bytes
 
-__all__ = ["DEFAULT_CHUNK_SIZE", "Info", "Selector", "ops", "select", "supported", "windows_from_cu_seqlens",
-           "workspace_bytes"]
+__all__ = ["DEFAULT_CHUNK_SIZE", "Info", "Selector", "compute_kv_norms", "ops", "select", "supported",
+           "windows_from_cu_seqlens", "workspace_bytes"]
 __version__ = "0.1.0"

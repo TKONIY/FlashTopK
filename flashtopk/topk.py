@@ -252,11 +252,13 @@ class Selector:
     @torch.no_grad()
     def run(self, q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor,
             kv_scales: Optional[torch.Tensor] = None,
-            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None
+            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None,
+            *, kv_norms: Optional[torch.Tensor] = None,
             ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         """(scores [num_q, topk] float32, indices [num_q, topk] int32) of q [num_q, 32, 128] against kv
         [seq_len_kv, 128] (FP8 with kv_scales [seq_len_kv] float32, or BF16), weights [num_q, 32] float32 and row
-        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices)."""
+        windows [ks, ke) (int32, or converted) with return_scores; else the indices alone (`out` then the indices).
+        Pass ``kv_norms`` (from ``compute_kv_norms(kv, kv_scales)``) to reuse precomputed key norms across calls."""
         self._check(q, kv, weights, ks, ke, kv_scales)
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
         rows = min(num_q, self.chunk_size)
@@ -278,7 +280,8 @@ class Selector:
             kv_scales = kv_scales.reshape(-1).contiguous()
         if num_q <= self.chunk_size:
             slice_scores = scores if self.return_scores else self._scores[:num_q]
-            self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices))
+            self.last_info = Info(*self._run_rows(q, kv, kv_scales, weights, ks, ke, slice_scores, indices,
+                                                  kv_norms=kv_norms))
             return result
 
         # Slices of chunk_size rows. Each slice's health is folded into the call's on the device (word H_CAND_MAX is
@@ -291,7 +294,7 @@ class Selector:
             b = min(num_q, a + self.chunk_size)
             slice_scores = scores[a:b] if self.return_scores else self._scores[:b - a]
             health, pruned, estimate = self._run_rows(q[a:b], kv, kv_scales, weights[a:b], ks[a:b], ke[a:b],
-                                                      slice_scores, indices[a:b])
+                                                      slice_scores, indices[a:b], kv_norms=kv_norms)
             cand_max = torch.maximum(total[H_CAND_MAX:H_CAND_MAX + 1], health[H_CAND_MAX:H_CAND_MAX + 1])
             total.add_(health)
             total[H_CAND_MAX:H_CAND_MAX + 1].copy_(cand_max)
@@ -302,7 +305,8 @@ class Selector:
         self.last_info = Info(total, pruned_any, estimate)
         return result
 
-    def _run_rows(self, q, kv, kv_scales, weights, ks, ke, scores, indices):
+    def _run_rows(self, q, kv, kv_scales, weights, ks, ke, scores, indices, *,
+                  kv_norms: Optional[torch.Tensor] = None):
         """One pass over at most chunk_size rows, writing their selection into scores and indices: (health, pruned,
         estimate) as Info takes them."""
         num_q, seq_len_kv = q.shape[0], kv.shape[0]
@@ -353,7 +357,7 @@ class Selector:
                 launch.scan(q, kv, kv_scales, weights, ks, ke, *scan_gate)
             elif mode == "always":
                 q_prune, w_prune, allowance, knsc, _ = planner.plan_operands(q, weights, kv, kv_scales, ks, ke, origin,
-                                                                             inv_delta, th_bucket)
+                                                                             inv_delta, th_bucket, kv_norms=kv_norms)
                 launch.prune_scan(q, q_prune, kv, kv_scales, knsc, weights, w_prune, allowance, ks, ke, *gate)
                 pruned = True
             else:
@@ -364,6 +368,7 @@ class Selector:
                 plan = planner.adaptive_estimate(
                     q, weights, kv, kv_scales, ks, ke, origin, inv_delta, th_bucket,
                     self._flag, scan_ks, prune_ks, self._estimate, prune24_ks, use_eff_window=True,
+                    kv_norms=kv_norms,
                 )
                 estimate = self._estimate
                 if graph_cond.is_capturing(q.device.index):
@@ -436,7 +441,8 @@ _SELECTORS: dict = {}
 def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor,
            kv_scales: Optional[torch.Tensor] = None, topk: int = 2048, pruning: Optional[str] = None,
            out: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None] = None, chunk_size: Optional[int] = None,
-           return_scores: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+           return_scores: bool = False, *, kv_norms: Optional[torch.Tensor] = None
+           ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Selector(...).run(...) with a selector kept per (device, dtype, topk, pruning, chunk_size, return_scores), its
     workspace grown to the largest call seen."""
     key = (q.device, q.dtype, topk, pruning, chunk_size, return_scores)
@@ -444,4 +450,4 @@ def select(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor, ks: torch.T
     if selector is None:
         selector = _SELECTORS[key] = Selector(topk, dtype=q.dtype, device=q.device, pruning=pruning,
                                               chunk_size=chunk_size, return_scores=return_scores)
-    return selector.run(q, kv, weights, ks, ke, kv_scales, out)
+    return selector.run(q, kv, weights, ks, ke, kv_scales, out, kv_norms=kv_norms)
